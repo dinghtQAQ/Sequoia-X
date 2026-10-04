@@ -31,25 +31,35 @@ class TurtleTradeStrategy(BaseStrategy):
         """
         from datetime import date
 
-        import baostock as bs
+        from sequoia_x.data.baostock_session import (
+            BaostockRequestError,
+            BaostockSession,
+            LoginFailure,
+        )
 
         today_str = date.today().strftime("%Y-%m-%d")
         market_caps: dict[str, float] = {}
 
-        bs.login()
+        session = BaostockSession(max_retries=0)
         try:
             for symbol in symbols:
                 bs_code = self.engine._to_baostock_code(symbol)
-                rs = bs.query_history_k_data_plus(
-                    bs_code,
-                    "close,volume,turn",
-                    start_date=today_str,
-                    end_date=today_str,
-                    frequency="d",
-                    adjustflag="3",  # 不复权，真实价格
-                )
-                while rs.next():
-                    row = rs.get_row_data()
+                try:
+                    rows = session.query_history_k_data_plus(
+                        bs_code,
+                        "close,volume,turn",
+                        today_str,
+                        today_str,
+                        frequency="d",
+                        adjustflag="3",  # 不复权，真实价格
+                    )
+                except LoginFailure as exc:
+                    logger.error(f"流通市值查询登录失败，停止查询: {exc}")
+                    break
+                except BaostockRequestError as exc:
+                    logger.error(f"[{symbol}] 流通市值查询失败: {exc.kind}: {exc}")
+                    continue
+                for row in rows:
                     try:
                         close = float(row[0])
                         volume = float(row[1])
@@ -57,10 +67,10 @@ class TurtleTradeStrategy(BaseStrategy):
                         if turn > 0:
                             circulating_shares = volume / (turn / 100)
                             market_caps[symbol] = circulating_shares * close
-                    except (ValueError, ZeroDivisionError):
+                    except (ValueError, ZeroDivisionError, IndexError):
                         continue
         finally:
-            bs.logout()
+            session.close()
 
         return market_caps
 

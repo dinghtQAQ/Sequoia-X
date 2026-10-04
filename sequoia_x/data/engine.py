@@ -31,26 +31,36 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
-def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
-    import baostock as bs
-    bs.login()
+def _bs_fetch_batch(tasks: list) -> tuple[list, list[str]]:
+    """多进程 worker：独立会话拉取 baostock 数据。
+
+    返回 (行, 失败代码)。超时和连接失败记入失败列表，不静默跳过。
+    """
+    from sequoia_x.data.baostock_session import BaostockRequestError, BaostockSession
+
+    session = BaostockSession()
     results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
-    return results
+    failed: list[str] = []
+    try:
+        for symbol, bs_code, start, end in tasks:
+            try:
+                rows = session.query_history_k_data_plus(
+                    bs_code,
+                    "date,open,high,low,close,volume,amount",
+                    start,
+                    end,
+                    frequency="d",
+                    adjustflag="1",  # 后复权
+                )
+            except BaostockRequestError as exc:
+                logger.error(f"[{symbol}] {exc.kind}: {exc}")
+                failed.append(symbol)
+                continue
+            for row in rows:
+                results.append([symbol] + row)
+    finally:
+        session.close()
+    return results, failed
 
 
 class DataEngine:
@@ -132,8 +142,14 @@ class DataEngine:
             batch_results = pool.map(_bs_fetch_batch, chunks)
 
         all_rows = []
-        for batch in batch_results:
+        failed_symbols: list[str] = []
+        for batch, failed in batch_results:
             all_rows.extend(batch)
+            failed_symbols.extend(failed)
+        if failed_symbols:
+            logger.error(
+                f"sync_today_bulk: {len(failed_symbols)} 只股票拉取失败: {','.join(failed_symbols)}"
+            )
 
         if not all_rows:
             logger.info("无新数据（可能非交易日）")
@@ -159,28 +175,23 @@ class DataEngine:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。
 
         容错机制：
-        - 单只股票失败自动重试 3 次，间隔递增（2s/4s/8s）
-        - 每 200 只股票自动重连 baostock（防止长连接超时）
+        - 单只股票超时或断连后关闭连接，最多重建 2 次再查
+        - 每 200 只股票主动重连，避免长连接超时
         - 已入库的自动 skip，中断后可重跑续传
         """
         import time
         from datetime import date, timedelta
 
-        import baostock as bs
+        from sequoia_x.data.baostock_session import (
+            BaostockRequestError,
+            BaostockSession,
+            LoginFailure,
+        )
 
         today_str = date.today().strftime("%Y-%m-%d")
         max_retries = 3
         reconnect_interval = 200  # 每处理 N 只股票重连一次
-
-        def _login():
-            lg = bs.login()
-            if lg.error_code != "0":
-                logger.error(f"baostock 登录失败: {lg.error_msg}")
-                return False
-            return True
-
-        if not _login():
-            return
+        session = BaostockSession(max_retries=max_retries - 1)
 
         success = 0
         skipped = 0
@@ -202,11 +213,8 @@ class DataEngine:
                 # 定期重连，防止长连接超时
                 since_reconnect += 1
                 if since_reconnect >= reconnect_interval:
-                    bs.logout()
+                    session.close()
                     time.sleep(1)
-                    if not _login():
-                        logger.error("重连失败，终止回填")
-                        return
                     since_reconnect = 0
 
                 start = last_date or self.start_date
@@ -215,44 +223,20 @@ class DataEngine:
 
                 bs_code = self._to_baostock_code(symbol)
 
-                # 带重试的查询
-                rows = []
-                query_ok = False
-                for attempt in range(max_retries):
-                    try:
-                        rs = bs.query_history_k_data_plus(
-                            bs_code,
-                            "date,open,high,low,close,volume,amount",
-                            start_date=start,
-                            end_date=today_str,
-                            frequency="d",
-                            adjustflag="1",  # 后复权
-                        )
-
-                        if rs.error_code != "0":
-                            raise RuntimeError(rs.error_msg)
-
-                        rows = []
-                        while rs.next():
-                            rows.append(rs.get_row_data())
-                        query_ok = True
-                        break
-
-                    except Exception as exc:
-                        if attempt < max_retries - 1:
-                            wait = 2 ** (attempt + 1)
-                            logger.warning(
-                                f"[{symbol}] 第{attempt + 1}次失败: {exc}，{wait}s 后重试"
-                            )
-                            time.sleep(wait)
-                            # 重连 baostock
-                            bs.logout()
-                            time.sleep(1)
-                            _login()
-                        else:
-                            logger.warning(f"[{symbol}] {max_retries}次重试均失败，跳过")
-
-                if not query_ok:
+                try:
+                    rows = session.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount",
+                        start,
+                        today_str,
+                        frequency="d",
+                        adjustflag="1",  # 后复权
+                    )
+                except LoginFailure as exc:
+                    logger.error(f"[{symbol}] 登录失败，终止回填: {exc}")
+                    return
+                except BaostockRequestError as exc:
+                    logger.error(f"[{symbol}] {exc.kind}: {exc}")
                     failed += 1
                     continue
 
@@ -260,7 +244,10 @@ class DataEngine:
                     skipped += 1
                     continue
 
-                df = pd.DataFrame(rows, columns=rs.fields)
+                df = pd.DataFrame(
+                    rows,
+                    columns=["date", "open", "high", "low", "close", "volume", "amount"],
+                )
                 for col in ["open", "high", "low", "close", "volume", "amount"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
                 df = df.dropna(subset=["close"])
@@ -292,7 +279,7 @@ class DataEngine:
                     )
 
         finally:
-            bs.logout()
+            session.close()
 
         logger.info(f"回填完成 — 成功: {success} | 跳过: {skipped} | 失败: {failed}")
 
@@ -300,30 +287,26 @@ class DataEngine:
 
     def get_all_symbols(self) -> list[str]:
         """通过 baostock 获取全市场 A 股代码列表。"""
-        import baostock as bs
+        from sequoia_x.data.baostock_session import BaostockRequestError, BaostockSession
 
-        lg = bs.login()
-        if lg.error_code != "0":
-            logger.error(f"baostock 登录失败: {lg.error_msg}")
-            return []
-
+        session = BaostockSession(max_retries=0)
         try:
-            rs = bs.query_stock_basic(code_name="", code="")
-            symbols = []
-            while rs.next():
-                row = rs.get_row_data()
-                code = row[0]           # "sh.600000" or "sz.000001"
-                status = row[4]         # "1" = 上市
-                stock_type = row[5]     # "1" = 股票
-                if status == "1" and stock_type == "1":
-                    symbols.append(code.split(".")[1])  # 提取纯数字代码
-            logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
-            return symbols
-        except Exception as e:
-            logger.error(f"获取股票列表失败: {e}")
+            rows = session.query_stock_basic()
+        except BaostockRequestError as exc:
+            logger.error(f"获取股票列表失败: {exc.kind}: {exc}")
             return []
         finally:
-            bs.logout()
+            session.close()
+
+        symbols = []
+        for row in rows:
+            code = row[0]           # "sh.600000" or "sz.000001"
+            status = row[4]         # "1" = 上市
+            stock_type = row[5]     # "1" = 股票
+            if status == "1" and stock_type == "1":
+                symbols.append(code.split(".")[1])  # 提取纯数字代码
+        logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
+        return symbols
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:

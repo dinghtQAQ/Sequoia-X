@@ -40,16 +40,29 @@ class FeishuNotifier:
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
         """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
-        import baostock as bs
-        bs.login()
+        from sequoia_x.data.baostock_session import (
+            BaostockRequestError,
+            BaostockSession,
+            LoginFailure,
+        )
+
+        session = BaostockSession(timeout=30, max_retries=0)
         mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
+        try:
+            for code in symbols:
+                prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                try:
+                    rows = session.query_stock_basic(code=f"{prefix}.{code}")
+                except LoginFailure as exc:
+                    logger.error(f"股票名称查询登录失败，停止查询: {exc}")
+                    break
+                except BaostockRequestError as exc:
+                    logger.error(f"[{code}] 股票名称查询失败: {exc.kind}: {exc}")
+                    continue
+                if rows:
+                    mapping[code] = rows[0][1]  # 第2个字段是股票名称
+        finally:
+            session.close()
         return mapping
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:

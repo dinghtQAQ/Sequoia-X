@@ -12,6 +12,12 @@ from sequoia_x.core.config import Settings
 from sequoia_x.notify.feishu import FeishuNotifier
 
 
+@pytest.fixture(autouse=True)
+def no_live_name_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """名称查询会连 baostock；推送测试只关心卡片和 Webhook。"""
+    monkeypatch.setattr(FeishuNotifier, "_get_stock_names", staticmethod(lambda symbols: {}))
+
+
 def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
     return Settings(
         db_path="data/test.db",
