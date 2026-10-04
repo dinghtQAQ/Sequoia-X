@@ -32,7 +32,7 @@ def make_engine_in(tmp_dir: str) -> tuple[DataEngine, Settings]:
 @h_settings(max_examples=50, deadline=None)
 def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
     """相同 (symbol, date) 插入两次，数据库中该组合记录数应保持为 1。"""
-    with tempfile.TemporaryDirectory() as tmp_dir:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
         engine, _ = make_engine_in(tmp_dir)
         row = {
             "symbol": symbol, "date": str(trade_date),

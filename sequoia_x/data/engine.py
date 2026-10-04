@@ -1,12 +1,19 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
+import queue
 import sqlite3
+import threading
 from pathlib import Path
 
 import pandas as pd
 
 from sequoia_x.core.config import Settings
 from sequoia_x.core.logger import get_logger
+from sequoia_x.data.baostock_session import (
+    BaostockRequestError,
+    BaostockSession,
+    LoginFailure,
+)
 
 logger = get_logger(__name__)
 
@@ -31,36 +38,95 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
-def _bs_fetch_batch(tasks: list) -> tuple[list, list[str]]:
-    """多进程 worker：独立会话拉取 baostock 数据。
+_DEFAULT_SYNC_WORKERS = 4
+_SYMBOL_FETCH_RETRIES = 2
+_KLINE_FIELDS = "date,open,high,low,close,volume,amount"
 
-    返回 (行, 失败代码)。超时和连接失败记入失败列表，不静默跳过。
+
+def _bs_fetch_symbol(
+    task: tuple[str, str, str, str],
+    max_retries: int = _SYMBOL_FETCH_RETRIES,
+) -> list[list]:
+    """拉取单只股票。连接类失败先关闭并重建会话，再按限定次数重试。
+
+    登录失败不重试，直接抛出，避免在未登录状态下继续查询。
     """
-    from sequoia_x.data.baostock_session import BaostockRequestError, BaostockSession
+    symbol, bs_code, start, end = task
+    attempts = max_retries + 1
+    last_error: BaostockRequestError | None = None
+    for attempt in range(attempts):
+        session = BaostockSession(max_retries=0)
+        try:
+            return session.query_history_k_data_plus(
+                bs_code,
+                _KLINE_FIELDS,
+                start,
+                end,
+                frequency="d",
+                adjustflag="1",  # 后复权
+            )
+        except LoginFailure:
+            raise
+        except BaostockRequestError as exc:
+            last_error = exc
+            logger.warning(f"[{symbol}] {exc.kind}（第 {attempt + 1}/{attempts} 次）: {exc}")
+            if attempt >= max_retries:
+                raise
+        finally:
+            session.close()
+    raise last_error or BaostockRequestError(f"[{symbol}] 拉取失败", code=bs_code)
 
-    session = BaostockSession()
-    results = []
-    failed: list[str] = []
-    try:
-        for symbol, bs_code, start, end in tasks:
+
+def _collect_symbol_rows(
+    tasks: list,
+    worker_count: int,
+) -> tuple[list, list[str], LoginFailure | None]:
+    """有界并发拉取。单股请求失败或登录失败只记入失败列表，不丢其他股票。"""
+    pending: queue.Queue = queue.Queue()
+    for task in tasks:
+        pending.put(task)
+    results: queue.Queue = queue.Queue()
+
+    def worker() -> None:
+        while True:
             try:
-                rows = session.query_history_k_data_plus(
-                    bs_code,
-                    "date,open,high,low,close,volume,amount",
-                    start,
-                    end,
-                    frequency="d",
-                    adjustflag="1",  # 后复权
-                )
-            except BaostockRequestError as exc:
-                logger.error(f"[{symbol}] {exc.kind}: {exc}")
-                failed.append(symbol)
+                task = pending.get_nowait()
+            except queue.Empty:
+                return
+            symbol = task[0]
+            try:
+                rows = _bs_fetch_symbol(task)
+            except LoginFailure as exc:
+                results.put(("login", symbol, exc))
                 continue
-            for row in rows:
-                results.append([symbol] + row)
-    finally:
-        session.close()
-    return results, failed
+            except BaostockRequestError as exc:
+                results.put(("failed", symbol, exc))
+                continue
+            results.put(("ok", symbol, rows))
+
+    threads = [threading.Thread(target=worker, name=f"sync-{index}") for index in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    rows_out: list = []
+    failed: list[str] = []
+    login_error: LoginFailure | None = None
+    while not results.empty():
+        kind, symbol, payload = results.get()
+        if kind == "login":
+            login_error = payload
+            failed.append(symbol)
+            logger.error(f"[{symbol}] 登录失败: {payload}")
+            continue
+        if kind == "failed":
+            logger.error(f"[{symbol}] {payload.kind}: {payload}")
+            failed.append(symbol)
+            continue
+        for row in payload:
+            rows_out.append([symbol] + row)
+    return rows_out, failed, login_error
 
 
 class DataEngine:
@@ -105,9 +171,12 @@ class DataEngine:
     # ── 数据同步 ──
 
     def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+        """有界并发拉取增量数据（后复权），写入 SQLite。
+
+        默认最多 4 个 worker。单只股票最终失败或登录失败不影响其他股票。
+        若出现登录失败，已成功的结果写入后向调用方抛出。
+        """
         from datetime import date, timedelta
-        from multiprocessing import Pool
 
         today_str = date.today().strftime("%Y-%m-%d")
 
@@ -133,19 +202,10 @@ class DataEngine:
             logger.info("所有股票已是最新，无需更新")
             return 0
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
+        n_workers = min(_DEFAULT_SYNC_WORKERS, len(tasks))
+        logger.info(f"需要更新 {len(tasks)} 只股票，启动 {n_workers} 个 worker 并行拉取...")
 
-        n_workers = min(8, len(tasks))
-        chunks = [tasks[i::n_workers] for i in range(n_workers)]
-
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
-
-        all_rows = []
-        failed_symbols: list[str] = []
-        for batch, failed in batch_results:
-            all_rows.extend(batch)
-            failed_symbols.extend(failed)
+        all_rows, failed_symbols, login_error = _collect_symbol_rows(tasks, n_workers)
         if failed_symbols:
             logger.error(
                 f"sync_today_bulk: {len(failed_symbols)} 只股票拉取失败: {','.join(failed_symbols)}"
@@ -153,6 +213,8 @@ class DataEngine:
 
         if not all_rows:
             logger.info("无新数据（可能非交易日）")
+            if login_error is not None:
+                raise login_error
             return 0
 
         df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
@@ -163,12 +225,16 @@ class DataEngine:
 
         count = len(df)
         with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
+            conn.executemany(
+                "DELETE FROM stock_daily WHERE symbol = ? AND date = ?",
+                list(zip(df["symbol"], df["date"])),
+            )
             df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
             conn.commit()
 
         logger.info(f"sync_today_bulk: 写入 {count} 条数据")
+        if login_error is not None:
+            raise login_error
         return count
 
     def backfill(self, symbols: list[str]) -> None:

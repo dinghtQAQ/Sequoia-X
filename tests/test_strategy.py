@@ -23,7 +23,7 @@ from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 @h_settings(max_examples=30, deadline=None)
 def test_strategy_run_returns_list_of_str(symbols: list[str]) -> None:
     """属性 9：run() 应返回 list[str]，每个元素为非空字符串。"""
-    with tempfile.TemporaryDirectory() as tmp_dir:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp_dir:
         settings = Settings(
             db_path=str(Path(tmp_dir) / "test.db"),
             start_date="2024-01-01",
