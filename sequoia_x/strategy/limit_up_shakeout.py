@@ -18,7 +18,7 @@ class LimitUpShakeoutStrategy(BaseStrategy):
     4. 支撑不破：今日 low >= 昨日 close
 
     Attributes:
-        webhook_key: 路由到 'shakeout' 专属飞书机器人。
+        webhook_key: Bark 分组 'shakeout'。
     """
 
     webhook_key: str = "shakeout"

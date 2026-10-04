@@ -17,7 +17,7 @@ class UptrendLimitDownStrategy(BaseStrategy):
                 且今日 volume > 20日均量的 2.0 倍
 
     Attributes:
-        webhook_key: 路由到 'limit_down' 专属飞书机器人。
+        webhook_key: Bark 分组 'limit_down'。
     """
 
     webhook_key: str = "limit_down"

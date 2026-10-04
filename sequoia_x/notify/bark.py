@@ -1,4 +1,4 @@
-"""飞书通知模块：将选股结果通过 Webhook 推送至飞书群。"""
+"""Bark 通知模块：将选股结果通过 Bark 推送至设备。"""
 
 import json
 from datetime import date
@@ -11,20 +11,20 @@ from sequoia_x.core.logger import get_logger
 logger = get_logger(__name__)
 
 
-class FeishuNotifier:
-    """飞书 Webhook 推送器。
+class BarkNotifier:
+    """Bark 推送器。
 
-    根据策略的 webhook_key 路由到对应的飞书机器人。
-    若 webhook_key 未在 Settings.strategy_webhooks 中配置，
-    则 fallback 到 Settings.feishu_webhook_url。
+    与 FeishuNotifier 保持同一调用面：send(symbols, strategy_name, webhook_key)。
+    webhook_key 不再路由到不同 URL，而是作为 Bark 的 group，便于按策略归档。
+    推送地址由 Settings.bark_server 与 Settings.bark_key 拼接。
     """
 
     def __init__(self, settings: Settings) -> None:
         """
-        初始化 FeishuNotifier。
+        初始化 BarkNotifier。
 
         Args:
-            settings: Settings 实例，提供 Webhook URL 配置。
+            settings: Settings 实例，提供 Bark 服务器与设备 Key。
         """
         self.settings = settings
 
@@ -65,46 +65,21 @@ class FeishuNotifier:
             session.close()
         return mapping
 
-    def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
+    def _build_message(self, symbols: list[str], strategy_name: str, group: str) -> dict:
         today = date.today().strftime("%Y-%m-%d")
         names = self._get_stock_names(symbols)
 
-        links: list[str] = []
+        lines: list[str] = []
         for code in symbols:
             xq_code = self._to_xueqiu_code(code)
             name = names.get(code, xq_code)
-            links.append(f"[{name}](https://xueqiu.com/S/{xq_code})")
+            lines.append(f"{name} {code} https://xueqiu.com/S/{xq_code}")
 
-        symbol_text = " ".join(links) if links else "（无选股结果）"
-
+        symbol_text = "\n".join(lines) if lines else "（无选股结果）"
         return {
-            "msg_type": "interactive",
-            "card": {
-                "header": {
-                    "title": {
-                        "tag": "plain_text",
-                        "content": f"📈 Sequoia-X 选股播报 | {strategy_name}",
-                    },
-                    "template": "blue",
-                },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
-                        },
-                    },
-                    {"tag": "hr"},
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**选股列表：**\n{symbol_text}",
-                        },
-                    },
-                ],
-            },
+            "title": f"Sequoia-X 选股播报 | {strategy_name}",
+            "body": f"日期：{today}\n策略：{strategy_name}\n选股数量：{len(symbols)}\n{symbol_text}",
+            "group": group,
         }
 
     def send(
@@ -114,21 +89,18 @@ class FeishuNotifier:
         webhook_key: str = "default",
     ) -> None:
         """
-        将选股结果格式化为飞书卡片消息并 POST 至对应 Webhook。
-
-        根据 webhook_key 从 Settings 中查找专属 URL；
-        若未配置，则 fallback 到 feishu_webhook_url。
+        将选股结果格式化为 Bark 消息并 POST 至设备推送地址。
 
         Args:
             symbols: 选股结果代码列表。
-            strategy_name: 策略名称，用于卡片标题。
-            webhook_key: 策略标识，用于路由到对应飞书机器人。
+            strategy_name: 策略名称，用于消息标题。
+            webhook_key: 策略标识，作为 Bark group。
 
         Raises:
             不抛出异常，HTTP 失败时记录 ERROR 日志。
         """
-        url = self.settings.feishu_webhook_url
-        payload = self._build_card(symbols, strategy_name)
+        url = self.settings.get_webhook_url(webhook_key)
+        payload = self._build_message(symbols, strategy_name, webhook_key)
 
         try:
             resp = requests.post(
@@ -137,17 +109,14 @@ class FeishuNotifier:
                 headers={"Content-Type": "application/json"},
                 timeout=10,
             )
-            # 解析飞书真正的返回体
             resp_json = resp.json()
-
-            # 飞书真正的成功标志是内部的 code == 0
-            if resp.status_code != 200 or resp_json.get("code") != 0:
+            if resp.status_code != 200 or resp_json.get("code") != 200:
                 logger.error(
-                    f"飞书推送失败 [{webhook_key}] "
-                    f"HTTP状态={resp.status_code} 飞书响应={resp.text}"
+                    f"Bark 推送失败 [{webhook_key}] "
+                    f"HTTP状态={resp.status_code} Bark响应={resp.text}"
                 )
             else:
-                logger.info(f"飞书推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
+                logger.info(f"Bark 推送成功 [{webhook_key}]，共 {len(symbols)} 只股票")
 
         except requests.RequestException as exc:
-            logger.error(f"飞书推送请求异常 [{webhook_key}]：{exc}")
+            logger.error(f"Bark 推送请求异常 [{webhook_key}]：{exc}")

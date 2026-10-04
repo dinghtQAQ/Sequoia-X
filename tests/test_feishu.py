@@ -22,6 +22,7 @@ def make_settings(webhook_url: str = "https://example.com/default") -> Settings:
     return Settings(
         db_path="data/test.db",
         start_date="2024-01-01",
+        bark_key="device-key",
         feishu_webhook_url=webhook_url,
     )
 
@@ -40,7 +41,7 @@ def test_notification_contains_all_symbols(symbols: list[str]) -> None:
     notifier = FeishuNotifier(settings)
 
     with patch("requests.post") as mock_post:
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"code": 0})
         notifier.send(symbols=symbols, strategy_name="TestStrategy")
 
     call_args = mock_post.call_args
@@ -61,7 +62,7 @@ def test_notification_uses_config_url(webhook_url: str) -> None:
     notifier = FeishuNotifier(settings)
 
     with patch("requests.post") as mock_post:
-        mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: {"code": 0})
         notifier.send(symbols=["000001"], strategy_name="Test", webhook_key="default")
 
     called_url = mock_post.call_args.args[0] if mock_post.call_args.args else mock_post.call_args.kwargs.get("url")
@@ -91,7 +92,9 @@ def test_http_failure_logs_error(status_code: int) -> None:
     feishu_logger.addHandler(handler)
     try:
         with patch("requests.post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=status_code, text="error")
+            mock_post.return_value = MagicMock(
+                status_code=status_code, text="error", json=lambda: {"code": status_code}
+            )
             notifier.send(symbols=["000001"], strategy_name="Test")
     finally:
         feishu_logger.removeHandler(handler)
