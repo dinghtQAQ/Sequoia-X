@@ -2,7 +2,7 @@
 
 两种运行模式：
   python main.py               # 日常模式：最多 4 个 worker 增量补数据 + 跑策略 + Bark 推送
-  python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
+  python main.py --backfill    # 回填模式：同时保存后复权日线和不复权日线
 """
 
 import argparse
@@ -34,7 +34,7 @@ def main() -> None:
     parser.add_argument(
         "--backfill",
         action="store_true",
-        help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
+        help="回填模式：同时保存后复权日线和不复权日线",
     )
     args = parser.parse_args()
 

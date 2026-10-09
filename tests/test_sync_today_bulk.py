@@ -62,10 +62,20 @@ class ScriptedSession:
         self.calls: list[str] = []
         ScriptedSession.instances.append(self)
 
-    def query_history_k_data_plus(self, code: str, *args, **kwargs) -> list[list[str]]:
+    def query_history_k_data_plus(
+        self,
+        code: str,
+        fields: str,
+        start_date: str,
+        end_date: str,
+        frequency: str = "d",
+        adjustflag: str = "3",
+    ) -> list[list[str]]:
         self.calls.append(code)
-        ScriptedSession.queried.append(code)
-        script = ScriptedSession.scripts[code]
+        ScriptedSession.queried.append((code, adjustflag))
+        script = ScriptedSession.scripts.get((code, adjustflag))
+        if script is None:
+            script = ScriptedSession.scripts[code]
         item = script.pop(0)
         if isinstance(item, BaseException):
             raise item
@@ -109,7 +119,9 @@ def test_default_workers_stay_at_most_four(scripted, workspace: Path, monkeypatc
     today = date.today().strftime("%Y-%m-%d")
     symbols = ["000001", "000002", "000003", "600000", "600001"]
     for symbol in symbols:
-        scripted.scripts[DataEngine._to_baostock_code(symbol)] = [[bar(today)]]
+        code = DataEngine._to_baostock_code(symbol)
+        scripted.scripts[(code, "1")] = [[bar(today)]]
+        scripted.scripts[(code, "3")] = [[bar(today)]]
 
     engine = make_engine(workspace)
     seed(engine, symbols, yesterday)
@@ -122,7 +134,8 @@ def test_successful_rows_are_written_and_rerun_keeps_unique_dates(scripted, work
     """正常结果写入 SQLite；同一天重跑不会撞唯一约束。"""
     yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     today = date.today().strftime("%Y-%m-%d")
-    scripted.scripts["sz.000001"] = [[bar(today, "12.0")]]
+    scripted.scripts[("sz.000001", "1")] = [[bar(today, "12.0")]]
+    scripted.scripts[("sz.000001", "3")] = [[bar(today, "9.0")]]
 
     engine = make_engine(workspace)
     seed(engine, ["000001"], yesterday)
@@ -130,27 +143,61 @@ def test_successful_rows_are_written_and_rerun_keeps_unique_dates(scripted, work
     again = engine.sync_today_bulk()
     frame = engine.get_ohlcv("000001")
 
-    assert written == 1
+    assert written == 2
     assert again == 0
     assert frame["date"].tolist() == [yesterday, today]
     assert frame.loc[frame["date"] == today, "close"].iloc[0] == 12.0
+    assert engine.get_raw_ohlcv("000001").loc[lambda df: df["date"] == today, "close"].iloc[0] == 9.0
+
+
+def test_daily_sync_fills_stale_raw_bars_without_rewriting_adjusted(
+    scripted, workspace: Path
+) -> None:
+    """后复权已到今天时，日常同步仍补齐较旧的不复权日线，且不改写后复权价格。"""
+    yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = date.today().strftime("%Y-%m-%d")
+    scripted.scripts[("sz.000001", "3")] = [[bar(today, "10.0")]]
+
+    engine = make_engine(workspace)
+    seed(engine, ["000001"], yesterday)
+    with sqlite3.connect(engine.db_path) as conn:
+        conn.execute(
+            "INSERT INTO stock_daily (symbol, date, open, high, low, close, volume, turnover) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("000001", today, 20.0, 20.0, 20.0, 20.0, 2000.0, 22000.0),
+        )
+        conn.execute(
+            "INSERT INTO stock_daily_raw (symbol, date, open, high, low, close, volume, turnover) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("000001", yesterday, 9.0, 9.0, 9.0, 9.0, 1000.0, 9000.0),
+        )
+
+    written = engine.sync_today_bulk()
+    raw = engine.get_raw_ohlcv("000001")
+
+    assert written == 1
+    assert engine.get_ohlcv("000001").loc[lambda df: df["date"] == today, "close"].iloc[0] == 20.0
+    assert raw["date"].tolist() == [yesterday, today]
+    assert raw.loc[raw["date"] == today, "close"].iloc[0] == 10.0
+    assert scripted.queried == [("sz.000001", "3")]
 
 
 def test_retry_rebuilds_connection_then_keeps_the_row(scripted, workspace: Path) -> None:
     """单股请求失败后按限定次数重试，重试前重建连接，成功结果仍入库。"""
     yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     today = date.today().strftime("%Y-%m-%d")
-    scripted.scripts["sz.000001"] = [
+    scripted.scripts[("sz.000001", "1")] = [
         ConnectionFailure("连接中断", code="sz.000001"),
         [bar(today, "13.0")],
     ]
+    scripted.scripts[("sz.000001", "3")] = [[bar(today, "9.0")]]
 
     engine = make_engine(workspace)
     seed(engine, ["000001"], yesterday)
     written = engine.sync_today_bulk()
     close = engine.get_ohlcv("000001").loc[lambda df: df["date"] == today, "close"].iloc[0]
 
-    assert written == 1
+    assert written == 2
     assert close == 13.0
     assert len(scripted.instances) >= 2
     assert scripted.closes >= 1
@@ -162,12 +209,14 @@ def test_one_symbol_failure_does_not_drop_the_rest(
     """单只股票最终失败不影响其他股票，汇总日志报告失败数量和代码。"""
     yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     today = date.today().strftime("%Y-%m-%d")
-    scripted.scripts["sz.000001"] = [
+    scripted.scripts[("sz.000001", "1")] = [
         ConnectionFailure("第一次", code="sz.000001"),
         ConnectionFailure("第二次", code="sz.000001"),
         ConnectionFailure("第三次", code="sz.000001"),
     ]
-    scripted.scripts["sh.600000"] = [[bar(today, "21.0")]]
+    scripted.scripts[("sz.000001", "3")] = [[bar(today, "9.0")]]
+    scripted.scripts[("sh.600000", "1")] = [[bar(today, "21.0")]]
+    scripted.scripts[("sh.600000", "3")] = [[bar(today, "19.0")]]
     messages: list[str] = []
 
     engine = make_engine(workspace)
@@ -177,7 +226,7 @@ def test_one_symbol_failure_does_not_drop_the_rest(
     survivor = engine.get_ohlcv("600000")
     failed = engine.get_ohlcv("000001")
 
-    assert written == 1
+    assert written == 3
     assert survivor["date"].tolist() == [yesterday, today]
     assert failed["date"].tolist() == [yesterday]
     assert any("1" in message and "000001" in message for message in messages)
@@ -187,8 +236,10 @@ def test_login_failure_keeps_rows_already_fetched(scripted, workspace: Path) -> 
     """登录失败会向上抛出；已经返回的其他股票仍写入，失败股不入库。"""
     yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     today = date.today().strftime("%Y-%m-%d")
-    scripted.scripts["sz.000001"] = [LoginFailure("登录失败", code="sz.000001")]
-    scripted.scripts["sh.600000"] = [[bar(today, "21.0")]]
+    scripted.scripts[("sz.000001", "1")] = [LoginFailure("登录失败", code="sz.000001")]
+    scripted.scripts[("sz.000001", "3")] = [[bar(today, "9.0")]]
+    scripted.scripts[("sh.600000", "1")] = [[bar(today, "21.0")]]
+    scripted.scripts[("sh.600000", "3")] = [[bar(today, "19.0")]]
 
     engine = make_engine(workspace)
     seed(engine, ["000001", "600000"], yesterday)
@@ -202,17 +253,20 @@ def test_failed_symbol_rerun_does_not_erase_other_symbols(scripted, workspace: P
     """失败股补跑同一天时，只替换该股，不删掉当天已成功的其他股票。"""
     yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
     today = date.today().strftime("%Y-%m-%d")
-    scripted.scripts["sz.000001"] = [
+    scripted.scripts[("sz.000001", "1")] = [
         ConnectionFailure("第一次", code="sz.000001"),
         ConnectionFailure("第二次", code="sz.000001"),
         ConnectionFailure("第三次", code="sz.000001"),
     ]
-    scripted.scripts["sh.600000"] = [[bar(today, "21.0")]]
+    scripted.scripts[("sz.000001", "3")] = [[bar(today, "9.0")]]
+    scripted.scripts[("sh.600000", "1")] = [[bar(today, "21.0")]]
+    scripted.scripts[("sh.600000", "3")] = [[bar(today, "19.0")]]
 
     engine = make_engine(workspace)
     seed(engine, ["000001", "600000"], yesterday)
     engine.sync_today_bulk()
-    scripted.scripts["sz.000001"] = [[bar(today, "13.0")]]
+    scripted.scripts[("sz.000001", "1")] = [[bar(today, "13.0")]]
+    scripted.scripts[("sz.000001", "3")] = [[bar(today, "9.0")]]
     engine.sync_today_bulk()
 
     assert engine.get_ohlcv("600000")["date"].tolist() == [yesterday, today]
@@ -221,6 +275,6 @@ def test_failed_symbol_rerun_does_not_erase_other_symbols(scripted, workspace: P
 
 def test_symbol_fetch_retries_are_bounded(scripted) -> None:
     """单股拉取的重试次数是限定的，耗尽后抛出可识别失败。"""
-    scripted.scripts["sz.000001"] = [ConnectionFailure("耗尽", code="sz.000001")]
+    scripted.scripts[("sz.000001", "1")] = [ConnectionFailure("耗尽", code="sz.000001")]
     with pytest.raises(BaostockRequestError):
-        _bs_fetch_symbol(("000001", "sz.000001", "2026-10-03", "2026-10-04"), max_retries=0)
+        _bs_fetch_symbol(("000001", "sz.000001", "2026-10-03", "2026-10-04", "1"), max_retries=0)
