@@ -30,12 +30,13 @@ class BaseStrategy(ABC):
         self.settings = settings
 
     @abstractmethod
-    def run(self) -> list[str]:
+    def run(self) -> list[str] | list[tuple[str, float]]:
         """
-        执行选股逻辑，返回选中的股票代码列表。
+        执行选股逻辑，返回选中的股票。
 
         Returns:
-            满足策略条件的股票代码列表，如 ['000001', '600519']。
+            股票代码列表，如 ['000001', '600519']；
+            或带排序值的列表，如 [('000001', 1.5)]，按排序值从高到低。
             无选股结果时返回空列表。
         """
         ...

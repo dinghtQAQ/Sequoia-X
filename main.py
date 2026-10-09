@@ -80,12 +80,17 @@ def main() -> None:
             strategy_name = type(strategy).__name__
             logger.info(f"执行策略：{strategy_name}")
 
-            selected: list[str] = strategy.run()
-            logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
+            selected = strategy.run()
+            symbols = (
+                [symbol for symbol, _ranking in selected]
+                if isinstance(strategy, MaVolumeStrategy)
+                else selected
+            )
+            logger.info(f"{strategy_name} 选出 {len(symbols)} 只股票")
 
-            if selected:
+            if symbols:
                 notifier.send(
-                    symbols=selected,
+                    symbols=symbols,
                     strategy_name=strategy_name,
                     webhook_key=strategy.webhook_key,
                 )

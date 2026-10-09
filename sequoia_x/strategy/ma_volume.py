@@ -21,15 +21,16 @@ class MaVolumeStrategy(BaseStrategy):
 
     webhook_key: str = "ma_volume"
 
-    def run(self) -> list[str]:
+    def run(self) -> list[tuple[str, float]]:
         """
-        遍历全市场，返回满足均线金叉+放量条件的股票代码列表。
+        遍历全市场，返回满足均线金叉+放量条件的股票及排序值。
 
         Returns:
-            满足条件的股票代码列表。
+            按排序值从高到低排列的 (股票代码, 排序值)。
+            排序值是信号日成交额乘以收盘价相对 20 日均线的距离。
         """
         symbols = self.engine.get_local_symbols()
-        selected: list[str] = []
+        selected: list[tuple[str, float]] = []
 
         for symbol in symbols:
             try:
@@ -53,11 +54,15 @@ class MaVolumeStrategy(BaseStrategy):
                 volume_surge = last["volume"] > last["vol_ma20"] * 1.5
 
                 if golden_cross and volume_surge:
-                    selected.append(symbol)
+                    ranking = float(last["turnover"]) * (
+                        float(last["close"]) / float(last["ma20"]) - 1
+                    )
+                    selected.append((symbol, ranking))
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] 策略计算失败：{exc}")
                 continue
 
+        selected.sort(key=lambda item: (-item[1], item[0]))
         logger.info(f"MaVolumeStrategy 选出 {len(selected)} 只股票")
         return selected
