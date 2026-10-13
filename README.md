@@ -21,7 +21,7 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 python main.py               # 日常模式：增量补数据 + 跑策略 + Bark 推送（2~3分钟）
 python main.py --backfill     # 回填模式：全市场历史K线一次性灌入（约12分钟）
 python main.py --compare MaVolume --start 2024-01-20 --end 2024-01-25
-                              # 规则比较：当前只跑通一个比较场景，结果写入 results
+                              # 规则比较：一次跑完 4×4 共 16 个场景，结果写入 results
 ```
 
 ---
