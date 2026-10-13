@@ -36,6 +36,11 @@ def main() -> None:
         action="store_true",
         help="回填模式：同时保存后复权日线和不复权日线",
     )
+    parser.add_argument("--compare", metavar="STRATEGY", help="规则比较：一次只接受一个选股策略")
+    parser.add_argument("--start", help="比较区间开始日期")
+    parser.add_argument("--end", help="比较区间结束日期")
+    parser.add_argument("--buy-rule", default="close", help="当前只跑通收盘价买入")
+    parser.add_argument("--sell-rule", default="stop8-take15-hold2", help="当前只跑通持有 2 个交易日")
     args = parser.parse_args()
 
     try:
@@ -48,6 +53,24 @@ def main() -> None:
 
         # 3. 初始化数据引擎
         engine = DataEngine(settings)
+
+        if args.compare:
+            from datetime import datetime
+
+            from sequoia_x.rule_compare import compare_rules
+
+            compare_rules(
+                strategy=args.compare,
+                db_path=settings.db_path,
+                results_dir="results",
+                run_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                start=args.start or settings.start_date,
+                end=args.end or date.today().isoformat(),
+                buy_rule=args.buy_rule,
+                sell_rule=args.sell_rule,
+            )
+            logger.info("规则比较完成，结果写入 results")
+            return
 
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
