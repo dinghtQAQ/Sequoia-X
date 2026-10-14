@@ -3,6 +3,15 @@
 > A 股量化选股系统 V2 | A-Share Quantitative Stock Selection System V2
 
 ---
+## myquestion
+ma交易的持有（卖出）规则不合理
+- 8% 止损、15% 止盈，最多 10 个交易日
+- 只有 8% 止损，最多 10 个交易日
+- 5% 止损、10% 止盈，最多 5 个交易日
+- 收盘跌破 20 日均线、15% 止盈，最多 20 个交易日
+https://github.com/sngyai/Sequoia-X/issues/128提供的数据，下边评论有补充，ma在60哥交易日时收益和胜率最大化
+先等第一次回测的结果出来
+---
 
 ## 简介 | Introduction
 
