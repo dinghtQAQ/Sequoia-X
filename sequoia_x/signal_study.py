@@ -28,6 +28,7 @@ def study_signals(
     start: str,
     end: str,
     horizons: Sequence[int] = DEFAULT_HORIZONS,
+    dedup_days: int | None = None,
 ) -> Path:
     """按信号日限定样本，用区间外的后续日线补足观察窗口，返回汇总文件。"""
     if strategy != "MaVolume":
@@ -43,6 +44,11 @@ def study_signals(
     if not horizons or any(not isinstance(item, int) or item <= 0 for item in horizons):
         raise SignalStudyError("观察周期必须为正整数交易日")
     horizons = sorted(set(horizons))
+    if dedup_days is not None:
+        if not isinstance(dedup_days, int) or dedup_days <= 0:
+            raise SignalStudyError("固定去重窗口必须为正整数交易日")
+        if dedup_days < max(horizons):
+            raise SignalStudyError("固定去重窗口不能短于最长观察周期")
 
     bars = _read_bars(db_path)
     calendar = sorted(bars["date"].unique())
@@ -50,12 +56,13 @@ def study_signals(
         raise SignalStudyError("信号区间内没有本地交易日")
     signals = find_ma_volume_signals(bars)
     signals = signals.loc[signals["date"].between(start, end)].reset_index(drop=True)
-    observations = _observe(bars, signals, calendar, horizons)
+    observations = _observe(bars, signals, calendar, horizons, dedup_days)
 
     complete = observations.loc[observations["status"] == "完整"]
+    dedup_policy = "持有期去重" if dedup_days is None else "固定窗口去重"
     cohorts = {
         "全部信号": complete,
-        "持有期去重": complete.loc[complete["accepted"]],
+        dedup_policy: complete.loc[complete["accepted"]],
     }
     common_ids = {}
     for policy, cohort in cohorts.items():
@@ -75,6 +82,7 @@ def study_signals(
                 summary.append({
                     "观察周期": horizon,
                     "去重口径": policy,
+                    "去重窗口": 0 if policy == "全部信号" else (dedup_days or horizon),
                     "样本口径": label,
                     "总信号数": len(signals),
                     "接受信号数": accepted,
@@ -92,14 +100,17 @@ def study_signals(
     output = Path(results_dir)
     output.mkdir(parents=True, exist_ok=True)
     stem = f"{strategy}_signal_study_{stamp}"
+    if dedup_days is not None:
+        stem += f"_dedup{dedup_days}"
     summary_path = output / f"{stem}.csv"
     pd.DataFrame(summary).to_csv(summary_path, index=False, encoding="utf-8-sig")
     details = observations.drop(columns="signal_id").rename(columns={
         "symbol": "股票代码", "date": "信号日", "close": "信号日收盘价",
         "horizon": "观察周期", "target_date": "目标日", "target_close": "目标日收盘价",
-        "return": "收益率", "status": "状态", "accepted": "纳入持有期去重",
+        "return": "收益率", "status": "状态", "accepted": "纳入去重样本",
+        "dedup_days": "去重窗口",
     })
-    details["去重说明"] = details["纳入持有期去重"].map({True: "保留", False: "观察期内重复信号"})
+    details["去重说明"] = details["纳入去重样本"].map({True: "保留", False: "去重窗口内重复信号"})
     details["股票代码"] = details["股票代码"].map(
         lambda symbol: ("sh" if symbol.startswith(("6", "9")) else "sz") + symbol
     )
@@ -113,13 +124,15 @@ def study_signals(
         "horizons": horizons,
         "total_signals": len(signals),
         "common_samples": len(common_ids["全部信号"]),
-        "deduplicated_common_samples": len(common_ids["持有期去重"]),
+        "deduplicated_common_samples": len(common_ids[dedup_policy]),
+        "dedup_days": dedup_days,
+        "effective_dedup_days_by_horizon": {str(item): dedup_days or item for item in horizons},
         "accepted_signals_by_horizon": {str(item): int(accepted_counts.get(item, 0)) for item in horizons},
         "price_basis": "stock_daily 后复权收盘价",
         "formula": "close(D+n) / close(D) - 1",
         "signal": "昨日 MA5 < MA20，今日 MA5 > MA20，今日量 > 含当日的20日均量×1.5",
         "calendar": "stock_daily 中全市场日期的有序并集，D+n 为第 n 个后续交易日",
-        "deduplication": "保留全部信号基准；持有期去重按各周期独立从区间开始处理，初始无占用。接受D日信号后，D至D+n日闭区间内不再接受同股，D+n+1起恢复；拒绝信号不延长占用，不额外添加卖出后冷却",
+        "deduplication": "保留全部信号基准；各周期初始无占用。默认去重窗口n等于各自观察周期，可指定不短于最长观察周期的固定窗口。接受D日信号后，D至D+n日闭区间内不再接受同股，D+n+1起恢复；拒绝信号不延长窗口",
         "selection_timing": "先按历史信号顺序决定去重，不使用后续价格有效性或收益决定是否接受信号",
         "common_cohort": "在各自去重口径下，所有请求周期均接受且拥有有效目标价格的相同信号集合",
         "missing_prices": "不补值、不顺延、不在区间末尾提前退出；明细标注原因",
@@ -155,6 +168,7 @@ def _observe(
     signals: pd.DataFrame,
     calendar: list[str],
     horizons: Sequence[int],
+    dedup_days: int | None = None,
 ) -> pd.DataFrame:
     date_index = {value: index for index, value in enumerate(calendar)}
     prices = bars[["symbol", "date", "close"]].rename(
@@ -165,7 +179,8 @@ def _observe(
         rows = signals[["symbol", "date", "close"]].copy()
         rows["signal_id"] = rows.index
         rows["horizon"] = horizon
-        rows["accepted"] = _non_overlapping_mask(signals, date_index, horizon)
+        rows["dedup_days"] = dedup_days or horizon
+        rows["accepted"] = _non_overlapping_mask(signals, date_index, dedup_days or horizon)
         rows["target_date"] = rows["date"].map(
             lambda value: calendar[date_index[value] + horizon]
             if date_index[value] + horizon < len(calendar) else None

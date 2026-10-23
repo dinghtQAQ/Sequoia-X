@@ -48,6 +48,10 @@ def main() -> None:
         "--horizons", type=int, nargs="+", default=tuple(range(20, 61)),
         help="观察周期，单位为交易日，默认逐一统计 20 至 60 日",
     )
+    parser.add_argument(
+        "--dedup-days", type=int,
+        help="固定同股去重窗口，单位为交易日，不能短于最长观察周期；默认随各观察周期",
+    )
     args = parser.parse_args()
 
     try:
@@ -71,6 +75,7 @@ def main() -> None:
                 start=args.start or settings.start_date,
                 end=args.end or date.today().isoformat(),
                 horizons=args.horizons,
+                dedup_days=args.dedup_days,
             )
             logger.info(f"信号收益研究完成，汇总写入 {summary_path}")
             return

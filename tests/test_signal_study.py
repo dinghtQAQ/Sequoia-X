@@ -167,7 +167,7 @@ def test_holding_window_blocks_endpoint_and_rejected_signal_does_not_extend_it(t
     ]
     assert filtered["接受信号数"].tolist() == [3, 2, 2]
     assert filtered["重复过滤数"].tolist() == [0, 1, 1]
-    selected = samples.loc[(samples["观察周期"] == 21) & samples["纳入持有期去重"]]
+    selected = samples.loc[(samples["观察周期"] == 21) & samples["纳入去重样本"]]
     assert selected["信号日"].tolist() == [dates[20], dates[62]]
     assert metadata["accepted_signals_by_horizon"] == {"20": 3, "21": 2, "41": 2}
 
@@ -185,10 +185,36 @@ def test_deduplication_does_not_skip_first_signal_based_on_future_missing_price(
 
     summary, samples, _ = _study(tmp_path, end=DATES[41], horizons=(40,))
 
-    assert samples["纳入持有期去重"].tolist() == [True, False]
+    assert samples["纳入去重样本"].tolist() == [True, False]
     assert samples["状态"].tolist() == ["目标日缺少价格", "完整"]
     assert summary.loc[summary["去重口径"] == "持有期去重", "有效样本数"].eq(0).all()
     assert summary.loc[summary["去重口径"] == "全部信号", "有效样本数"].eq(1).all()
+
+
+def test_fixed_dedup_window_is_independent_of_return_horizon(tmp_path: Path) -> None:
+    closes = WARMUP * 3 + [20.0] * 60
+    volumes = ([1000.0] * 20 + [2000.0]) * 3 + [1000.0] * 60
+    dates = pd.bdate_range("2025-01-02", periods=len(closes)).strftime("%Y-%m-%d").tolist()
+    rows = [("000001", day, close, volume) for day, close, volume in zip(dates, closes, volumes)]
+    _seed(tmp_path / "history.db", rows)
+
+    summary, samples, metadata = _study(
+        tmp_path, end=dates[62], horizons=(5, 20), dedup_days=21,
+    )
+
+    filtered = summary.loc[
+        (summary["去重口径"] == "固定窗口去重") & (summary["样本口径"] == "各周期有效样本")
+    ]
+    assert filtered["接受信号数"].tolist() == [2, 2]
+    assert filtered["去重窗口"].tolist() == [21, 21]
+    accepted = samples.loc[samples["纳入去重样本"]]
+    assert accepted.groupby("观察周期")["信号日"].apply(list).to_dict() == {
+        5: [dates[20], dates[62]], 20: [dates[20], dates[62]],
+    }
+    first = accepted.loc[accepted["信号日"] == dates[20]].set_index("观察周期")
+    assert first.loc[5, "目标日"] == dates[25]
+    assert first.loc[20, "目标日"] == dates[40]
+    assert metadata["effective_dedup_days_by_horizon"] == {"5": 21, "20": 21}
 
 
 @pytest.mark.parametrize("overrides, message", [
@@ -198,6 +224,9 @@ def test_deduplication_does_not_skip_first_signal_based_on_future_missing_price(
     ({"horizons": (0,)}, "正整数"),
     ({"horizons": (-1,)}, "正整数"),
     ({"horizons": ()}, "正整数"),
+    ({"dedup_days": 0}, "固定去重窗口必须为正整数"),
+    ({"dedup_days": -1}, "固定去重窗口必须为正整数"),
+    ({"dedup_days": 20}, "不能短于最长观察周期"),
 ])
 def test_invalid_parameters_write_nothing(tmp_path: Path, overrides: dict, message: str) -> None:
     with pytest.raises(SignalStudyError, match=message):
@@ -235,7 +264,7 @@ def test_cli_study_skips_sync_notifications_and_data_engine(
     monkeypatch.setattr("sequoia_x.signal_study.study_signals", fake_study)
     monkeypatch.setattr("sys.argv", [
         "main.py", flag, "MaVolume", "--start", "2025-06-01", "--end", "2026-09-30",
-        "--horizons", "20", "60",
+        "--horizons", "20", "60", "--dedup-days", "120",
     ])
 
     main.main()
@@ -243,3 +272,4 @@ def test_cli_study_skips_sync_notifications_and_data_engine(
     assert len(calls) == 1
     assert calls[0]["strategy"] == "MaVolume"
     assert calls[0]["horizons"] == [20, 60]
+    assert calls[0]["dedup_days"] == 120
