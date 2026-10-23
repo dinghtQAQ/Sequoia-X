@@ -175,11 +175,11 @@ class DataEngine:
         return row[0] if row and row[0] else None
 
     def get_ohlcv(self, symbol: str) -> pd.DataFrame:
-        """读取后复权日线，只供选股策略使用。"""
+        """读取后复权日线，供选股和信号收益研究使用。"""
         return self._read_ohlcv(symbol, "stock_daily")
 
     def get_raw_ohlcv(self, symbol: str) -> pd.DataFrame:
-        """读取不复权日线，供规则比较和价格单使用。"""
+        """读取不复权日线，供原始市场价格核对。"""
         return self._read_ohlcv(symbol, "stock_daily_raw")
 
     def _read_ohlcv(self, symbol: str, table: str) -> pd.DataFrame:
@@ -288,8 +288,8 @@ class DataEngine:
     def backfill(self, symbols: list[str]) -> None:
         """一次回填同时保存后复权日线和不复权日线。
 
-        后复权写入 stock_daily，只供选股策略使用。
-        不复权写入 stock_daily_raw，供规则比较和价格单使用。
+        后复权写入 stock_daily，供选股和信号收益研究使用。
+        不复权写入 stock_daily_raw，保留供原始市场价格核对。
         两种日线按各自最新日期续传，重复回填不互相覆盖。
         不复权拉取失败时明确报错，不把后复权价格写入不复权表。
         """

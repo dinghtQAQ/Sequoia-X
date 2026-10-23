@@ -3,14 +3,8 @@
 > A 股量化选股系统 V2 | A-Share Quantitative Stock Selection System V2
 
 ---
-## myquestion
-ma交易的持有（卖出）规则不合理
-- 8% 止损、15% 止盈，最多 10 个交易日
-- 只有 8% 止损，最多 10 个交易日
-- 5% 止损、10% 止盈，最多 5 个交易日
-- 收盘跌破 20 日均线、15% 止盈，最多 20 个交易日
-https://github.com/sngyai/Sequoia-X/issues/128提供的数据，下边评论有补充，ma在60哥交易日时收益和胜率最大化
-先等第一次回测的结果出来
+当前优先复现 [Issue #128](https://github.com/sngyai/Sequoia-X/issues/128) 的 MA 信号统计。
+研究纳入全部金叉放量信号，按固定交易日统计后续收益，已移除原来的买卖规则组合和资金账户模拟。
 ---
 
 ## 简介 | Introduction
@@ -19,19 +13,38 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 系统以 OOP 架构、向量化计算和增量数据更新为核心设计原则，每日收盘后自动选股并推送至 Bark。
 
 数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据。
-后复权日线只供选股策略使用，不复权日线供规则比较和价格单使用，两种日线分开保存。
+后复权日线用于选股和信号收益研究，不复权日线保留供价格核对，两种日线分开保存。
 存储于本地 SQLite，彻底规避东方财富反爬问题。
 
 ---
 
-## 两种运行模式
+## 运行模式
 
 ```bash
 python main.py               # 日常模式：增量补数据 + 跑策略 + Bark 推送（2~3分钟）
 python main.py --backfill     # 回填模式：全市场历史K线一次性灌入（约12分钟）
-python main.py --compare MaVolume --start 2024-01-20 --end 2024-01-25
-                              # 规则比较：一次跑完 4×4 共 16 个场景，结果写入 results
+python main.py --study MaVolume --start 2025-06-01 --end 2026-09-30
+                              # 信号研究：默认逐一统计 20 至 60 个交易日
+python main.py --study MaVolume --start 2025-06-01 --end 2026-09-30 --horizons 20 40 60
+                              # 也可以只观察指定周期；--compare 是 --study 的兼容别名
 ```
+
+研究只读本地 `stock_daily`，不联网补数据或推送通知，不要求存在不复权日线。
+信号日区间之外的数据仍用于计算历史均线和完整的后续观察窗口。
+
+每个信号的 n 日收益为 `close(D+n) / close(D) - 1`，使用同一份后复权收盘价。
+MA 条件保持为：昨日 MA5 < MA20，今日 MA5 > MA20，今日量 > 含当日的 20 日均量 × 1.5。
+研究不设止盈止损、均线退出、费用、资金或仓位限制，不按排名截取，也不模拟涨跌停能否成交。
+同一股票不同日期的信号独立统计；仅以“股票代码＋信号日”区分，不加冷却期。
+
+`results` 中输出汇总 `.csv`、逐信号逐周期的 `_samples.csv` 和记录运行口径的 `_meta.json`。
+汇总包含各周期有效样本及所有请求周期的共同有效样本，分别给出样本数、胜率、平均收益和标准中位数。
+收益率以小数保存，例如 `0.0352` 表示 `3.52%`。
+缺少后续交易日或目标日价格的样本在明细中标注原因，不补值、不顺延、不提前平仓。
+
+作者评论确认 short/mid/long 为 5/20/60 日，但未公开完整的股票池、去重窗口和入场价格口径。
+因此当前实现提供可重复核对的研究定义，不保证复算出相同数字，也不能由原帖认定 60 日是最优周期。
+MA 排序公式和研究细节见 [研究说明](docs/research/ma-volume-entry.md)。
 
 ---
 
@@ -97,11 +110,12 @@ python main.py
 
 ```
 Sequoia-X/
-├── main.py                      # 入口：argparse 分发日常/回填模式
+├── main.py                      # 入口：日常/回填/信号研究模式
 ├── pyproject.toml               # 依赖声明 + ruff/pytest 配置
 ├── .env.example                 # 环境变量模板
 ├── data/                        # SQLite 数据库（运行时生成，不入 git）
 ├── sequoia_x/
+│   ├── signal_study.py          # MA 信号在固定交易日后的收益统计
 │   ├── core/
 │   │   ├── config.py            # Pydantic-settings 配置管理
 │   │   └── logger.py            # rich 结构化日志
