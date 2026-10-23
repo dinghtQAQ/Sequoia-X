@@ -1,8 +1,10 @@
 """Sequoia-X V2 主程序入口。
 
-两种运行模式：
+三种运行模式：
   python main.py               # 日常模式：最多 4 个 worker 增量补数据 + 跑策略 + Bark 推送
   python main.py --backfill    # 回填模式：同时保存后复权日线和不复权日线
+  python main.py --study MaVolume --start 2025-06-01 --end 2026-09-30
+                              # 本地 MA 信号后续收益研究，默认 20–60 个交易日
 """
 
 import argparse
@@ -36,9 +38,16 @@ def main() -> None:
         action="store_true",
         help="回填模式：同时保存后复权日线和不复权日线",
     )
-    parser.add_argument("--compare", metavar="STRATEGY", help="规则比较：一次只接受一个选股策略，并跑全部交易规则")
-    parser.add_argument("--start", help="比较区间开始日期")
-    parser.add_argument("--end", help="比较区间结束日期")
+    parser.add_argument(
+        "--study", "--compare", dest="study", metavar="STRATEGY",
+        help="信号收益研究：统计全部 MA 信号的固定周期收益（--compare 为兼容别名）",
+    )
+    parser.add_argument("--start", help="信号区间开始日期")
+    parser.add_argument("--end", help="信号区间结束日期")
+    parser.add_argument(
+        "--horizons", type=int, nargs="+", default=tuple(range(20, 61)),
+        help="观察周期，单位为交易日，默认逐一统计 20 至 60 日",
+    )
     args = parser.parse_args()
 
     try:
@@ -49,24 +58,25 @@ def main() -> None:
         logger = get_logger(__name__)
         logger.info("Sequoia-X V2 启动")
 
-        # 3. 初始化数据引擎
-        engine = DataEngine(settings)
-
-        if args.compare:
+        if args.study:
             from datetime import datetime
 
-            from sequoia_x.rule_compare import compare_rules
+            from sequoia_x.signal_study import study_signals
 
-            compare_rules(
-                strategy=args.compare,
+            summary_path = study_signals(
+                strategy=args.study,
                 db_path=settings.db_path,
                 results_dir="results",
                 run_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 start=args.start or settings.start_date,
                 end=args.end or date.today().isoformat(),
+                horizons=args.horizons,
             )
-            logger.info("规则比较完成，结果写入 results")
+            logger.info(f"信号收益研究完成，汇总写入 {summary_path}")
             return
+
+        # 3. 初始化数据引擎
+        engine = DataEngine(settings)
 
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
