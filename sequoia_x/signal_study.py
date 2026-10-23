@@ -53,29 +53,41 @@ def study_signals(
     observations = _observe(bars, signals, calendar, horizons)
 
     complete = observations.loc[observations["status"] == "完整"]
-    counts = complete.groupby("signal_id")["horizon"].nunique()
-    common_ids = counts.index[counts == len(horizons)]
+    cohorts = {
+        "全部信号": complete,
+        "持有期去重": complete.loc[complete["accepted"]],
+    }
+    common_ids = {}
+    for policy, cohort in cohorts.items():
+        counts = cohort.groupby("signal_id")["horizon"].nunique()
+        common_ids[policy] = counts.index[counts == len(horizons)]
+    accepted_counts = observations.loc[observations["accepted"]].groupby("horizon").size()
     summary = []
     for horizon in horizons:
-        rows = complete.loc[complete["horizon"] == horizon]
-        for label, selected in (
-            ("各周期有效样本", rows),
-            ("共同有效样本", rows.loc[rows["signal_id"].isin(common_ids)]),
-        ):
-            returns = selected["return"]
-            summary.append({
-                "观察周期": horizon,
-                "样本口径": label,
-                "总信号数": len(signals),
-                "有效样本数": len(returns),
-                "未纳入样本数": len(signals) - len(returns),
-                "胜率": float((returns > 0).mean()) if len(returns) else None,
-                "平均收益": returns.mean(),
-                "中位收益": returns.median(),
-                "信号开始": start,
-                "信号结束": end,
-                "数据截至": calendar[-1],
-            })
+        for policy, cohort in cohorts.items():
+            rows = cohort.loc[cohort["horizon"] == horizon]
+            accepted = len(signals) if policy == "全部信号" else int(accepted_counts.get(horizon, 0))
+            for label, selected in (
+                ("各周期有效样本", rows),
+                ("共同有效样本", rows.loc[rows["signal_id"].isin(common_ids[policy])]),
+            ):
+                returns = selected["return"]
+                summary.append({
+                    "观察周期": horizon,
+                    "去重口径": policy,
+                    "样本口径": label,
+                    "总信号数": len(signals),
+                    "接受信号数": accepted,
+                    "重复过滤数": len(signals) - accepted,
+                    "有效样本数": len(returns),
+                    "未纳入样本数": len(signals) - len(returns),
+                    "胜率": float((returns > 0).mean()) if len(returns) else None,
+                    "平均收益": returns.mean(),
+                    "中位收益": returns.median(),
+                    "信号开始": start,
+                    "信号结束": end,
+                    "数据截至": calendar[-1],
+                })
 
     output = Path(results_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -85,8 +97,9 @@ def study_signals(
     details = observations.drop(columns="signal_id").rename(columns={
         "symbol": "股票代码", "date": "信号日", "close": "信号日收盘价",
         "horizon": "观察周期", "target_date": "目标日", "target_close": "目标日收盘价",
-        "return": "收益率", "status": "状态",
+        "return": "收益率", "status": "状态", "accepted": "纳入持有期去重",
     })
+    details["去重说明"] = details["纳入持有期去重"].map({True: "保留", False: "观察期内重复信号"})
     details["股票代码"] = details["股票代码"].map(
         lambda symbol: ("sh" if symbol.startswith(("6", "9")) else "sz") + symbol
     )
@@ -99,13 +112,16 @@ def study_signals(
         "data_end": calendar[-1],
         "horizons": horizons,
         "total_signals": len(signals),
-        "common_samples": len(common_ids),
+        "common_samples": len(common_ids["全部信号"]),
+        "deduplicated_common_samples": len(common_ids["持有期去重"]),
+        "accepted_signals_by_horizon": {str(item): int(accepted_counts.get(item, 0)) for item in horizons},
         "price_basis": "stock_daily 后复权收盘价",
         "formula": "close(D+n) / close(D) - 1",
         "signal": "昨日 MA5 < MA20，今日 MA5 > MA20，今日量 > 含当日的20日均量×1.5",
         "calendar": "stock_daily 中全市场日期的有序并集，D+n 为第 n 个后续交易日",
-        "deduplication": "每个股票代码、信号日一笔；不同信号日独立保留，允许窗口重叠",
-        "common_cohort": "在所有请求周期均有有效目标价格的相同信号集合",
+        "deduplication": "保留全部信号基准；持有期去重按各周期独立从区间开始处理，初始无占用。接受D日信号后，D至D+n日闭区间内不再接受同股，D+n+1起恢复；拒绝信号不延长占用，不额外添加卖出后冷却",
+        "selection_timing": "先按历史信号顺序决定去重，不使用后续价格有效性或收益决定是否接受信号",
+        "common_cohort": "在各自去重口径下，所有请求周期均接受且拥有有效目标价格的相同信号集合",
         "missing_prices": "不补值、不顺延、不在区间末尾提前退出；明细标注原因",
         "filters": "无排名截取、止盈止损、均线退出、仓位、资金、费用或成交过滤",
         "limitations": "研究价格变化，不代表可成交收益；原帖股票池、去重窗口和价格口径未公开",
@@ -149,6 +165,7 @@ def _observe(
         rows = signals[["symbol", "date", "close"]].copy()
         rows["signal_id"] = rows.index
         rows["horizon"] = horizon
+        rows["accepted"] = _non_overlapping_mask(signals, date_index, horizon)
         rows["target_date"] = rows["date"].map(
             lambda value: calendar[date_index[value] + horizon]
             if date_index[value] + horizon < len(calendar) else None
@@ -162,3 +179,18 @@ def _observe(
         rows.loc[rows["target_date"].isna(), "status"] = "后续交易日不足"
         observations.append(rows)
     return pd.concat(observations, ignore_index=True)
+
+
+def _non_overlapping_mask(
+    signals: pd.DataFrame, date_index: dict[str, int], horizon: int,
+) -> pd.Series:
+    """只用已接受信号锁定该股观察期，期满的下一交易日恢复。"""
+    blocked_until: dict[str, int] = {}
+    accepted = set()
+    for row in signals.sort_values(["date", "symbol"]).itertuples():
+        index = date_index[row.date]
+        if index <= blocked_until.get(row.symbol, -1):
+            continue
+        accepted.add(row.Index)
+        blocked_until[row.symbol] = index + horizon
+    return pd.Series(signals.index.isin(accepted), index=signals.index, dtype=bool)
