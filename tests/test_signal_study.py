@@ -217,6 +217,35 @@ def test_fixed_dedup_window_is_independent_of_return_horizon(tmp_path: Path) -> 
     assert metadata["effective_dedup_days_by_horizon"] == {"5": 21, "20": 21}
 
 
+def test_correlation_study_preserves_baselines_and_audits_ranking_decision(tmp_path: Path) -> None:
+    for symbol in ("000001", "000002"):
+        _seed(tmp_path / "history.db", _bars(symbol, [22.0] * 60))
+    connection = sqlite3.connect(tmp_path / "history.db")
+    try:
+        connection.execute("ALTER TABLE stock_daily ADD COLUMN turnover REAL DEFAULT 100000000")
+        connection.execute("UPDATE stock_daily SET turnover=200000000 WHERE symbol='000002'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    summary, samples, metadata = _study(
+        tmp_path, dedup_days=60, corr_threshold=0.8, corr_window=20, corr_min_periods=10,
+    )
+
+    assert len(summary) == 18
+    baseline = summary.loc[summary["去重口径"].isin(["全部信号", "固定窗口去重"])]
+    assert baseline["有效样本数"].eq(2).all()
+    filtered = summary.loc[summary["去重口径"] == "固定窗口去重+相关性"]
+    assert filtered["有效样本数"].eq(1).all()
+    assert filtered["相关性过滤数"].eq(1).all()
+    rejected = samples.loc[samples["股票代码"] == "sz000001"]
+    assert rejected["相关性筛选说明"].eq("高相关").all()
+    assert rejected["相关对象"].eq("sz000002").all()
+    assert rejected["最大已知相关系数"].tolist() == pytest.approx([1.0] * 3)
+    assert metadata["correlation"]["accepted_signals_by_horizon"] == {"20": 1, "40": 1, "60": 1}
+    assert metadata["correlation"]["common_samples"] == 1
+
+
 @pytest.mark.parametrize("overrides, message", [
     ({"strategy": "TurtleTrade"}, "只支持 MaVolume"),
     ({"start": "2025-99-99"}, "日期参数无效"),
@@ -227,6 +256,10 @@ def test_fixed_dedup_window_is_independent_of_return_horizon(tmp_path: Path) -> 
     ({"dedup_days": 0}, "固定去重窗口必须为正整数"),
     ({"dedup_days": -1}, "固定去重窗口必须为正整数"),
     ({"dedup_days": 20}, "不能短于最长观察周期"),
+    ({"corr_threshold": 0}, "相关性阈值"),
+    ({"corr_threshold": 1.1}, "相关性阈值"),
+    ({"corr_threshold": 0.8, "corr_window": 1}, "相关性窗口"),
+    ({"corr_threshold": 0.8, "corr_min_periods": 61}, "共同观测数"),
 ])
 def test_invalid_parameters_write_nothing(tmp_path: Path, overrides: dict, message: str) -> None:
     with pytest.raises(SignalStudyError, match=message):
@@ -265,6 +298,7 @@ def test_cli_study_skips_sync_notifications_and_data_engine(
     monkeypatch.setattr("sys.argv", [
         "main.py", flag, "MaVolume", "--start", "2025-06-01", "--end", "2026-09-30",
         "--horizons", "20", "60", "--dedup-days", "120",
+        "--corr-threshold", "0.8", "--corr-window", "60", "--corr-min-periods", "40",
     ])
 
     main.main()
@@ -273,3 +307,6 @@ def test_cli_study_skips_sync_notifications_and_data_engine(
     assert calls[0]["strategy"] == "MaVolume"
     assert calls[0]["horizons"] == [20, 60]
     assert calls[0]["dedup_days"] == 120
+    assert calls[0]["corr_threshold"] == 0.8
+    assert calls[0]["corr_window"] == 60
+    assert calls[0]["corr_min_periods"] == 40

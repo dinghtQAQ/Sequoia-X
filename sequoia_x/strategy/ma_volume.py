@@ -8,6 +8,11 @@ from sequoia_x.strategy.base import BaseStrategy
 logger = get_logger(__name__)
 
 
+def ma_volume_ranking(turnover: float, close: float, ma20: float) -> float:
+    """日常展示和相关性去重共用的MA排序公式。"""
+    return float(turnover) * (float(close) / float(ma20) - 1)
+
+
 def find_ma_volume_signals(bars: pd.DataFrame) -> pd.DataFrame:
     """找出各股票历史上的金叉放量行，附 MA20；仅使用该行及以前的数据。"""
     history = bars.sort_values(["symbol", "date"]).reset_index(drop=True)
@@ -59,9 +64,7 @@ class MaVolumeStrategy(BaseStrategy):
                 if signals.empty or signals.iloc[-1]["date"] != df.iloc[-1]["date"]:
                     continue
                 last = signals.iloc[-1]
-                ranking = float(last["turnover"]) * (
-                    float(last["close"]) / float(last["ma20"]) - 1
-                )
+                ranking = ma_volume_ranking(last["turnover"], last["close"], last["ma20"])
                 selected.append((symbol, ranking))
 
             except Exception as exc:

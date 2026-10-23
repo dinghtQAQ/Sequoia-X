@@ -52,6 +52,9 @@ def main() -> None:
         "--dedup-days", type=int,
         help="固定同股去重窗口，单位为交易日，不能短于最长观察周期；默认随各观察周期",
     )
+    parser.add_argument("--corr-threshold", type=float, help="启用对数收益相关性去重，如0.8")
+    parser.add_argument("--corr-window", type=int, default=60, help="相关性历史窗口，默认60个交易日")
+    parser.add_argument("--corr-min-periods", type=int, default=40, help="最少共同收益观测数，默认40")
     args = parser.parse_args()
 
     try:
@@ -76,6 +79,9 @@ def main() -> None:
                 end=args.end or date.today().isoformat(),
                 horizons=args.horizons,
                 dedup_days=args.dedup_days,
+                corr_threshold=args.corr_threshold,
+                corr_window=args.corr_window,
+                corr_min_periods=args.corr_min_periods,
             )
             logger.info(f"信号收益研究完成，汇总写入 {summary_path}")
             return
