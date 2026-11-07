@@ -1,10 +1,8 @@
 """Sequoia-X V2 主程序入口。
 
-三种运行模式：
+两种运行模式：
   python main.py               # 日常模式：最多 4 个 worker 增量补数据 + 跑策略 + Bark 推送
-  python main.py --backfill    # 回填模式：同时保存后复权日线和不复权日线
-  python main.py --study MaVolume --start 2025-06-01 --end 2026-09-30
-                              # 本地 MA 信号后续收益研究，默认 20–60 个交易日
+  python main.py --backfill    # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
 """
 
 import argparse
@@ -36,25 +34,8 @@ def main() -> None:
     parser.add_argument(
         "--backfill",
         action="store_true",
-        help="回填模式：同时保存后复权日线和不复权日线",
+        help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
     )
-    parser.add_argument(
-        "--study", "--compare", dest="study", metavar="STRATEGY",
-        help="信号收益研究：统计全部 MA 信号的固定周期收益（--compare 为兼容别名）",
-    )
-    parser.add_argument("--start", help="信号区间开始日期")
-    parser.add_argument("--end", help="信号区间结束日期")
-    parser.add_argument(
-        "--horizons", type=int, nargs="+", default=tuple(range(20, 61)),
-        help="观察周期，单位为交易日，默认逐一统计 20 至 60 日",
-    )
-    parser.add_argument(
-        "--dedup-days", type=int,
-        help="固定同股去重窗口，单位为交易日，不能短于最长观察周期；默认随各观察周期",
-    )
-    parser.add_argument("--corr-threshold", type=float, help="启用对数收益相关性去重，如0.8")
-    parser.add_argument("--corr-window", type=int, default=60, help="相关性历史窗口，默认60个交易日")
-    parser.add_argument("--corr-min-periods", type=int, default=40, help="最少共同收益观测数，默认40")
     args = parser.parse_args()
 
     try:
@@ -64,27 +45,6 @@ def main() -> None:
         # 2. 初始化日志
         logger = get_logger(__name__)
         logger.info("Sequoia-X V2 启动")
-
-        if args.study:
-            from datetime import datetime
-
-            from sequoia_x.signal_study import study_signals
-
-            summary_path = study_signals(
-                strategy=args.study,
-                db_path=settings.db_path,
-                results_dir="results",
-                run_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                start=args.start or settings.start_date,
-                end=args.end or date.today().isoformat(),
-                horizons=args.horizons,
-                dedup_days=args.dedup_days,
-                corr_threshold=args.corr_threshold,
-                corr_window=args.corr_window,
-                corr_min_periods=args.corr_min_periods,
-            )
-            logger.info(f"信号收益研究完成，汇总写入 {summary_path}")
-            return
 
         # 3. 初始化数据引擎
         engine = DataEngine(settings)
@@ -120,17 +80,12 @@ def main() -> None:
             strategy_name = type(strategy).__name__
             logger.info(f"执行策略：{strategy_name}")
 
-            selected = strategy.run()
-            symbols = (
-                [symbol for symbol, _ranking in selected]
-                if isinstance(strategy, MaVolumeStrategy)
-                else selected
-            )
-            logger.info(f"{strategy_name} 选出 {len(symbols)} 只股票")
+            selected: list[str] = strategy.run()
+            logger.info(f"{strategy_name} 选出 {len(selected)} 只股票")
 
-            if symbols:
+            if selected:
                 notifier.send(
-                    symbols=symbols,
+                    symbols=selected,
                     strategy_name=strategy_name,
                     webhook_key=strategy.webhook_key,
                 )
