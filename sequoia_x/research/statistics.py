@@ -586,6 +586,7 @@ class AccountStatistics(FrozenModel):
     max_drawdown: float | None
     open_positions: int
     open_exposure: float | None
+    unexitable_exposure: float | None = None
     open_valuation: str
     total_costs: float
     unfilled_orders: int
@@ -768,6 +769,9 @@ def _account_statistics(
         if account.daily_nav
         else 0,
         open_exposure=account.daily_nav[-1].open_exposure if account.daily_nav else None,
+        unexitable_exposure=account.metrics.unexitable_exposure
+        if account.daily_nav and account.daily_nav[-1].nav > 0
+        else None,
         open_valuation=json.dumps(sorted(flags), ensure_ascii=False)
         if flags
         else "当日市场价格与应收权益估值",

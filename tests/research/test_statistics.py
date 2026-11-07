@@ -300,6 +300,45 @@ def test_zero_trade_report_keeps_nav_risk_and_immutable_failure(tmp_path, protoc
         )
 
 
+def test_legacy_report_load_checks_original_bytes_and_rearchive_keeps_version(
+    tmp_path, protocol_data
+):
+    import json
+    from hashlib import sha256
+
+    from sequoia_x.research.statistics import analyze_baseline, load_report, record_report
+
+    registry, frozen, candidate, comparison, sample, _, _ = account_example(tmp_path, protocol_data)
+    run = registry.start_experiment(
+        frozen.protocol_id,
+        parameters={},
+        stage="final_test",
+        purpose="exploration",
+        evidence_kind="historical_simulation",
+    )
+    report = analyze_baseline(registry, run.experiment_id, candidate, comparison, snapshot=sample)
+    legacy = report.model_dump(mode="json")
+    legacy["implementation_fingerprint"] = "historical-implementation-v1"
+    for role in ("candidate", "comparison"):
+        legacy[role].pop("unexitable_exposure")
+    original = json.dumps(legacy, ensure_ascii=False, indent=2).encode("utf8")
+    original_sha = sha256(original).hexdigest()
+    path = tmp_path / "legacy-report.json"
+    path.write_bytes(original)
+
+    loaded = load_report(path, original_sha)
+    assert loaded.candidate.unexitable_exposure is None
+    assert loaded.comparison.unexitable_exposure is None
+    assert loaded.implementation_fingerprint == "historical-implementation-v1"
+    archived = record_report(loaded, tmp_path / "new-serialization")
+    assert archived.sha256 != original_sha
+    assert load_report(archived.path, archived.sha256) == loaded
+    assert path.read_bytes() == original
+    path.write_bytes(original + b" ")
+    with pytest.raises(ValueError, match="内容指纹不符"):
+        load_report(path, original_sha)
+
+
 def test_one_hand_calculated_trade_reports_expectancy_and_missing_loss_group(
     tmp_path, protocol_data
 ):
@@ -353,6 +392,73 @@ def test_unfinished_position_does_not_become_a_win_or_disappear(tmp_path, protoc
     assert report.candidate.net_win_rate is report.candidate.net_expectancy is None
     assert report.candidate.open_positions == report.candidate.unfinished_trades == 1
     assert report.candidate.open_exposure == 0.9
+
+
+def test_report_keeps_unsupported_pre_maturity_position_and_exit_risk(tmp_path, protocol_data):
+    from copy import deepcopy
+
+    from sequoia_x.research.dataset import DatasetSnapshot
+    from sequoia_x.research.portfolio import run_portfolio
+    from sequoia_x.research.protocol import ResearchProtocol
+    from sequoia_x.research.replay import Signal
+    from sequoia_x.research.statistics import analyze_baseline, load_report, record_report
+
+    registry, frozen, _, _, sample, execution, selection = account_example(
+        tmp_path, protocol_data, sessions=10
+    )
+    raw = sample.model_dump(mode="json")
+    for state in raw["states"][7:]:
+        state.update(is_st=True, limit_up=10.5, limit_down=9.5)
+    sample = DatasetSnapshot.model_validate(raw)
+    values = frozen.protocol.model_dump(mode="json")
+    values.update(
+        study_id="pre-maturity-exit-risk",
+        strategy_version="ma-pre-maturity-risk",
+        comparison_version="cash-risk-reference",
+        data_snapshot_id=sample.snapshot_id,
+    )
+    values["trading"]["initial_capital"] = 11000
+    values["statistics"]["family_members"] = [values["strategy_version"]]
+    frozen = registry.freeze(ResearchProtocol.model_validate(values))
+    cash_values = deepcopy(values)
+    cash_values.update(
+        study_id="cash-pre-maturity-exit-risk",
+        strategy_version="cash-risk-reference",
+        comparison_version="cash-anchor",
+    )
+    cash = registry.freeze(ResearchProtocol.model_validate(cash_values))
+    candidate = run_portfolio(
+        sample,
+        frozen,
+        execution,
+        selection,
+        signals=(Signal(symbol="AAA", signal_date=sample.calendar[0]),),
+    )
+    comparison = run_portfolio(sample, cash, execution, selection, signals=())
+    run = registry.start_experiment(
+        frozen.protocol_id,
+        parameters={},
+        stage="final_test",
+        purpose="confirmation",
+        evidence_kind="historical_simulation",
+    )
+    report = analyze_baseline(registry, run.experiment_id, candidate, comparison, snapshot=sample)
+
+    # Hand calculation: 1000 shares * 10, plus 1000 cash; no exit has become due.
+    assert candidate.daily_nav[-1].market_value == 10000
+    assert candidate.daily_nav[-1].nav == 11000
+    assert report.candidate.open_exposure == pytest.approx(10000 / 11000)
+    assert report.candidate.unexitable_exposure == pytest.approx(10000 / 11000)
+    assert report.comparison.unexitable_exposure == 0
+    assert report.candidate.open_positions == report.candidate.unfinished_trades == 1
+    assert report.candidate.closed_trades == 0
+    assert report.candidate.net_win_rate is report.candidate.net_expectancy is None
+    assert not candidate.execution_qualified
+    assert any("risk_warning_rules_not_supported" in gap for gap in report.diagnostic_gaps)
+    assert report.decision.status == "insufficient_evidence"
+    assert report.b0_version is None
+    saved = record_report(report, tmp_path / "pre-maturity-reports")
+    assert load_report(saved.path, saved.sha256) == report
 
 
 def registered_parameters(candidate, comparison, sample, execution, selection):
