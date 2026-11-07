@@ -676,7 +676,7 @@ def test_identical_account_cannot_be_called_a_cost_stress(tmp_path, protocol_dat
 
 @pytest.mark.parametrize(("kind", "honest_cost"), [("parameter_neighbor", 5), ("cost_stress", 10)])
 @pytest.mark.parametrize(
-    ("variant", "changed_pool"),
+    ("variant", "changed_input"),
     [
         ("removed_all", True),
         ("removed_one", True),
@@ -687,13 +687,13 @@ def test_identical_account_cannot_be_called_a_cost_stress(tmp_path, protocol_dat
         ("features", True),
         ("episode", True),
         ("duplicated", True),
-        ("reordered", False),
+        ("reordered", True),
         ("feature_key_reordered", False),
         ("unchanged", False),
     ],
 )
-def test_trading_scenarios_keep_the_declared_raw_signal_pool(
-    tmp_path, protocol_data, variant, changed_pool, kind, honest_cost
+def test_trading_scenarios_keep_the_declared_raw_signal_sequence(
+    tmp_path, protocol_data, variant, changed_input, kind, honest_cost
 ):
     from copy import deepcopy
 
@@ -829,15 +829,205 @@ def test_trading_scenarios_keep_the_declared_raw_signal_pool(
     if variant == "removed_all":
         assert supplied.metrics.portfolio_net_return == 0
         assert report.robustness[0].primary_return_delta == 0
-    if not changed_pool:
+    if not changed_input:
         assert supplied.metrics.total_costs == honest_cost
         assert report.robustness[0].primary_return_delta == pytest.approx(-honest_cost / 11000)
         assert any(
             "未达到预登记净收益增量下限" in reason for reason in report.robustness[0].reasons
         )
-    assert any("信号池" in reason for reason in report.robustness[0].reasons) is changed_pool
-    assert any("信号池" in reason for reason in report.diagnostic_gaps) is changed_pool
+    assert any("信号池" in reason for reason in report.robustness[0].reasons) is changed_input
+    assert any("信号池" in reason for reason in report.diagnostic_gaps) is changed_input
     assert report.b0_version is None
+
+
+def test_scenario_preserves_signal_order_when_exit_fee_cash_is_shared(tmp_path, protocol_data):
+    """Controlled observed-tagged software fixture, never empirical return evidence."""
+    from copy import deepcopy
+
+    from sequoia_x.research.dataset import DatasetSnapshot
+    from sequoia_x.research.portfolio import PortfolioPolicy, run_portfolio
+    from sequoia_x.research.protocol import ResearchProtocol
+    from sequoia_x.research.replay import ExecutionPolicy, FeeSchedule, Signal
+    from sequoia_x.research.statistics import analyze_baseline, load_report, record_report
+
+    registry, original, _, _, sample, _, _ = account_example(tmp_path, protocol_data, sessions=63)
+    days = sample.calendar
+    raw = sample.model_dump(mode="json")
+    raw["manifest"].update(
+        symbols=["AAA", "BBB"],
+        universe_id="controlled-order-priority",
+        evidence_kind="observed",
+        source="Controlled software fixture, NOT market evidence",
+    )
+    raw["bars"], raw["states"] = [], []
+    for symbol in ("AAA", "BBB"):
+        previous = 10
+        for index, day in enumerate(days):
+            price = (
+                10.5
+                if symbol == "AAA" and index >= 62
+                else (10.1 if symbol == "BBB" and index >= 61 else 10)
+            )
+            raw["bars"].append(
+                dict(
+                    symbol=symbol,
+                    date=day,
+                    available_on=day,
+                    open=price,
+                    high=price,
+                    low=price,
+                    close=price,
+                    volume=100000,
+                    price_basis="raw",
+                )
+            )
+            raw["states"].append(
+                dict(
+                    symbol=symbol,
+                    effective_date=day,
+                    available_on=day,
+                    listed=True,
+                    suspended=False,
+                    is_st=False,
+                    board="SSE_MAIN",
+                    lot_size=100,
+                    limit_rule="bounded",
+                    limit_up=round(previous * 1.1, 2),
+                    limit_down=round(previous * 0.9, 2),
+                )
+            )
+            previous = price
+    sample = DatasetSnapshot.model_validate(raw)
+
+    def execution(final_fee):
+        return ExecutionPolicy(
+            fees=tuple(
+                FeeSchedule(
+                    effective_from=effective,
+                    commission_rate=0,
+                    min_commission=fee,
+                    stamp_tax_rate=0,
+                    transfer_fee_rate=0,
+                )
+                for effective, fee in ((date(2000, 1, 1), 0), (days[61], final_fee))
+            ),
+            slippage_bps=0,
+            max_order_quantity=1_000_000,
+            max_volume_participation=1,
+            volume_model="daily_volume_upper_bound",
+        )
+
+    ordinary, stressed = execution(5750), execution(11500)
+    selection = PortfolioPolicy(daily_entry_slots=2, selection="symbol_order", seed=7)
+    values = original.protocol.model_dump(mode="json")
+    values.update(
+        study_id="fee-order-base",
+        strategy_version="fee-order-base",
+        comparison_version="fee-order-cash",
+        comparison_role="approved_strategy",
+        data_snapshot_id=sample.snapshot_id,
+        universe=sample.manifest.universe_id,
+    )
+    values["trading"].update(
+        initial_capital=22000,
+        max_position_fraction=0.5,
+        max_positions=2,
+        fees=[f"execution_policy:{ordinary.policy_id}"],
+        capacity=f"selection_policy:{selection.policy_id}",
+        repeat_signal_policy="ignore_while_open",
+    )
+    values["statistics"]["family_members"] = ["fee-order-base", "fee-order-stress"]
+    values["acceptance"]["minimum_win_rate_delta"] = -0.01
+    frozen = registry.freeze(ResearchProtocol.model_validate(values))
+    cash_values = deepcopy(values)
+    cash_values.update(
+        study_id="fee-order-cash", strategy_version="fee-order-cash", comparison_version="anchor"
+    )
+    cash = registry.freeze(ResearchProtocol.model_validate(cash_values))
+    stress_values = deepcopy(values)
+    stress_values.update(study_id="fee-order-stress", strategy_version="fee-order-stress")
+    stress_values["trading"]["fees"] = [f"execution_policy:{stressed.policy_id}"]
+    stress = registry.freeze(ResearchProtocol.model_validate(stress_values))
+    signals = tuple(Signal(symbol=symbol, signal_date=days[0]) for symbol in ("AAA", "BBB"))
+    benchmark = {day: 22000 for day in days}
+    candidate = run_portfolio(
+        sample, frozen, ordinary, selection, signals=signals, benchmark=benchmark
+    )
+    comparison = run_portfolio(sample, cash, ordinary, selection, signals=(), benchmark=benchmark)
+    forward = run_portfolio(
+        sample, stress, stressed, selection, signals=signals, benchmark=benchmark
+    )
+    reverse = run_portfolio(
+        sample, stress, stressed, selection, signals=signals[::-1], benchmark=benchmark
+    )
+    parameters, reference, sectors, regimes = registered_parameters(
+        candidate, comparison, sample, ordinary, selection
+    )
+    parameters["execution_policies"][stressed.policy_id] = stressed.model_dump(mode="json")
+    parameters["statistics_plan"]["resampling"]["resamples"] = 100
+    parameters["statistics_plan"]["minimum_scenario_return_delta"] = -0.51
+    parameters["statistics_plan"]["scenarios"] = [
+        {
+            "scenario_id": "fee-order-stress",
+            "kind": "cost_stress",
+            "description": "Only all fees x2, retaining actual execution-input priority",
+            "cost_multiplier": 2,
+            "account": {
+                **parameters["statistics_plan"]["candidate"],
+                "protocol_id": stress.protocol_id,
+                "strategy_version": "fee-order-stress",
+                "execution_policy_id": stressed.policy_id,
+            },
+        }
+    ]
+    reports = {}
+    for name, account in (("forward", forward), ("reverse", reverse)):
+        run = registry.start_experiment(
+            frozen.protocol_id,
+            parameters=parameters,
+            stage="final_test",
+            purpose="exploration",
+            evidence_kind="historical_simulation",
+        )
+        reports[name] = analyze_baseline(
+            registry,
+            run.experiment_id,
+            candidate,
+            comparison,
+            snapshot=sample,
+            market_reference=reference,
+            exposure_reference=reference,
+            sector_map=sectors,
+            regime_map=regimes,
+            scenarios={"fee-order-stress": account},
+        )
+        assert registry.decisions(frozen.protocol.study_id)[-1] == reports[name].decision
+        assert reports[name].decision.evidence is None
+        assert reports[name].b0_version is None
+    assert registry.latest_approved(frozen.protocol.study_id, "historical_simulation") is None
+    assert forward.data_qualified and reverse.data_qualified
+    assert forward.execution_qualified and reverse.execution_qualified
+    assert sorted(s.signal_id for s in forward.signals) == sorted(
+        s.signal_id for s in reverse.signals
+    )
+    # Both start the exit auction with 2000 fee cash; only one stressed sell fits.
+    assert forward.daily_nav[-1].cash == 500
+    assert forward.daily_nav[-1].market_value == 10100
+    assert forward.daily_nav[-1].nav == 10600
+    assert reverse.daily_nav[-1].cash == 600
+    assert reverse.daily_nav[-1].market_value == 10500
+    assert reverse.daily_nav[-1].nav == 11100
+    assert reports["forward"].robustness[0].primary_return_delta == pytest.approx(10600 / 22000 - 1)
+    assert any(
+        "未达到预登记净收益增量下限" in reason
+        for reason in reports["forward"].robustness[0].reasons
+    )
+    assert reports["reverse"].robustness[0].primary_return_delta == pytest.approx(11100 / 22000 - 1)
+    assert any("执行顺序" in reason for reason in reports["reverse"].robustness[0].reasons)
+    assert any("执行顺序" in reason for reason in reports["reverse"].diagnostic_gaps)
+    assert any("执行顺序" in reason for reason in reports["reverse"].decision.reasons)
+    saved = record_report(reports["reverse"], tmp_path / "ordered-risk-report")
+    assert load_report(saved.path, saved.sha256) == reports["reverse"]
 
 
 def test_seed_is_reproducible_and_bonferroni_larger_family_widens_intervals():

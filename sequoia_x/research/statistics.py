@@ -971,10 +971,10 @@ def _scenario_change_reasons(
     parameters: dict,
 ) -> tuple[str, ...]:
     reasons = []
-    if Counter(signal.signal_id for signal in scenario.signals) != Counter(
+    if tuple(signal.signal_id for signal in scenario.signals) != tuple(
         signal.signal_id for signal in candidate.signals
     ):
-        reasons.append("稳健性场景改变了未声明的原始信号池")
+        reasons.append("稳健性场景改变了未声明的原始信号池或执行顺序")
     try:
         base = registry.get_protocol(candidate.protocol_id).protocol
         changed = registry.get_protocol(scenario.protocol_id).protocol
