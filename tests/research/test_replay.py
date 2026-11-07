@@ -598,3 +598,34 @@ def test_warmup_prices_are_available_but_warmup_signals_are_not_research_trades(
     )
     assert len(signal_frame(snapshot, "000001", days[22])) == 23
     assert replay_ma_signals(snapshot) == ()
+
+
+def test_suspended_quote_is_not_a_new_market_price_after_a_share_action():
+    from sequoia_x.research.dataset import CorporateAction
+    from sequoia_x.research.replay import mark_position
+
+    first, ex_day = date(2025, 1, 6), date(2025, 1, 7)
+    snapshot = sample(
+        [first, ex_day],
+        bars=[
+            bar(first, close=10),
+            bar(ex_day, open=None, high=None, low=None, close=10, volume=0, status="suspended"),
+        ],
+        states=[state(first), state(ex_day, suspended=True)],
+    )
+    unchanged = mark_position(snapshot, "000001", ex_day, 100)
+    assert unchanged.status == "stale"
+    assert unchanged.as_of == first
+    assert unchanged.value == 1000
+    changed = snapshot.model_copy(
+        update={
+            "actions": (
+                CorporateAction(
+                    symbol="000001", ex_date=ex_day, available_on=first, share_multiplier=2
+                ),
+            )
+        }
+    )
+    split_mark = mark_position(changed, "000001", ex_day, 200)
+    assert split_mark.status == "unreliable"
+    assert split_mark.value is None

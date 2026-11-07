@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+from math import isfinite
 from typing import Literal
 
 from pydantic import Field
@@ -170,6 +171,8 @@ class PortfolioResult(FrozenModel):
     selection_policy_id: str
     evidence_kind: Literal["synthetic", "observed"]
     data_qualified: bool
+    execution_qualified: bool
+    execution_reasons: tuple[str, ...]
     qualification_reasons: tuple[str, ...]
     initial_capital: float
     window: DateWindow
@@ -216,8 +219,29 @@ def run_portfolio(
     signals = tuple(signal for signal in signals if window.start <= signal.signal_date <= window.end)
     if len({signal.signal_id for signal in signals}) != len(signals):
         raise ValueError("同一 signal_id 不可重复提交")
+    reference = _benchmark_series(calendar, benchmark, protocol.trading.initial_capital)
     return _SharedAccount(snapshot, frozen_protocol, execution_policy, selection_policy,
-                          window, calendar, signals).run()
+                          window, calendar, signals, reference).run()
+
+
+def _benchmark_series(
+    calendar: tuple[date, ...], levels: Mapping[date, float] | None, capital: float,
+) -> tuple[BenchmarkDay, ...]:
+    if levels is None:
+        return ()
+    if any(day not in levels for day in calendar):
+        raise ValueError("基准必须覆盖完全相同的账户交易日历")
+    if any(not isfinite(levels[day]) or levels[day] <= 0 for day in calendar):
+        raise ValueError("基准水平必须是有限正值")
+    initial = Decimal(str(levels[calendar[0]]))
+    previous = _amount(capital)
+    rows = []
+    for day in calendar:
+        nav = _amount(Decimal(str(capital)) * Decimal(str(levels[day])) / initial)
+        rows.append(BenchmarkDay(date=day, nav=float(nav),
+                                 daily_net_return=float(nav / previous - 1)))
+        previous = nav
+    return tuple(rows)
 
 
 def _amount(value: float | int | Decimal) -> Decimal:
@@ -258,18 +282,22 @@ class _SharedAccount:
     def __init__(
         self, snapshot: DatasetSnapshot, frozen: FrozenProtocol, execution: ExecutionPolicy,
         selection: PortfolioPolicy, window: DateWindow, calendar: tuple[date, ...],
-        signals: tuple[Signal, ...],
+        signals: tuple[Signal, ...], benchmark: tuple[BenchmarkDay, ...],
     ) -> None:
         self.snapshot, self.frozen, self.execution, self.selection = snapshot, frozen, execution, selection
         self.window, self.calendar, self.signals = window, calendar, signals
+        self.benchmark = benchmark
         self.cash = _amount(frozen.protocol.trading.initial_capital)
         self.lots = {signal.signal_id: _Lot(signal) for signal in signals}
         self.orders: list[PortfolioOrder] = []
         self.fills: list[PortfolioFill] = []
         self.daily: list[DailyAccount] = []
         self.action_events: list[PortfolioCorporateAction] = []
+        self.execution_reasons: list[str] = []
         self.bars = {(bar.symbol, bar.date): bar for bar in snapshot.bars}
         self.reasons = list(audit_dataset(snapshot).reasons)
+        if not benchmark:
+            self.reasons.append("缺少同日历协议基准序列；基准收益不可估计")
         self.day_costs = Decimal(0)
         self.used_volume: dict[str, int] = {}
 
@@ -286,6 +314,22 @@ class _SharedAccount:
         if bar is not None and bar.open is not None and bar.price_basis == "raw":
             return _amount(Decimal(str(bar.open)) * lot.quantity)
         return lot.last_market_value
+
+    def _record_fill(self, fill: FillAttempt, order: PortfolioOrder) -> Decimal:
+        self.fills.append(PortfolioFill(**fill.model_dump(), order_id=order.order_id,
+                                        trade_id=order.trade_id, signal_id=order.signal_id))
+        self.used_volume[order.symbol] = self.used_volume.get(order.symbol, 0) + fill.quantity
+        self.cash += _amount(fill.cash_delta)
+        costs = _fill_costs(fill)
+        self.day_costs += costs
+        if fill.reason.startswith(("unsupported", "unknown", "missing", "invalid",
+                                   "state_", "execution_requires")):
+            reason = f"{order.order_id}:{fill.reason}"
+            self.execution_reasons.append(reason)
+            self.reasons.append("执行模型或输入未覆盖:" + reason)
+        if self.cash < 0:
+            raise ArithmeticError("账户现金守恒失败：出现借款")
+        return costs
 
     def _buy_pending(self, session: date, index: int) -> None:
         trading = self.frozen.protocol.trading
@@ -317,12 +361,7 @@ class _SharedAccount:
                 "buy", order.requested_quantity, float(budget), self.execution,
                 used_volume=self.used_volume.get(order.symbol, 0),
             )
-            self.fills.append(PortfolioFill(**fill.model_dump(), order_id=order.order_id,
-                                            trade_id=order.trade_id, signal_id=order.signal_id))
-            self.used_volume[order.symbol] = self.used_volume.get(order.symbol, 0) + fill.quantity
-            self.cash += _amount(fill.cash_delta)
-            costs = _fill_costs(fill)
-            self.day_costs += costs
+            costs = self._record_fill(fill, order)
             if fill.quantity:
                 lot.quantity = lot.entry_quantity = fill.quantity
                 lot.entry_date, lot.entry_index = session, index
@@ -338,8 +377,6 @@ class _SharedAccount:
                 "filled_quantity": fill.quantity, "frozen_cash": 0,
                 "status": fill.status, "reason": reason, "attempt_count": 1,
             })
-            if self.cash < 0:
-                raise ArithmeticError("账户现金守恒失败：出现借款")
 
     def _apply_actions(self, session: date) -> None:
         for lot in self.lots.values():
@@ -387,14 +424,9 @@ class _SharedAccount:
                 self.execution, acquired_on=lot.entry_date,
                 used_volume=self.used_volume.get(order.symbol, 0),
             )
-            self.fills.append(PortfolioFill(**fill.model_dump(), order_id=order.order_id,
-                                            trade_id=order.trade_id, signal_id=order.signal_id))
-            self.used_volume[order.symbol] = self.used_volume.get(order.symbol, 0) + fill.quantity
-            self.cash += _amount(fill.cash_delta)
+            costs = self._record_fill(fill, order)
             lot.exit_cash += _amount(fill.cash_delta)
-            costs = _fill_costs(fill)
             lot.costs += costs
-            self.day_costs += costs
             lot.quantity -= fill.quantity
             lot.last_market_value = _amount(lot.last_market_value * lot.quantity / quantity)
             if not lot.quantity:
@@ -458,6 +490,8 @@ class _SharedAccount:
             lot = self.lots[signal.signal_id]
             held = any(item.quantity and item.signal.symbol == signal.symbol
                        for item in self.lots.values())
+            pending = any(order.side == "buy" and order.status == "pending"
+                          and order.symbol == signal.symbol for order in self.orders)
             bar = self._bar(signal.symbol, session)
             state = self.snapshot.state_at(signal.symbol, session)
             reason = "next_session_day"
@@ -469,6 +503,8 @@ class _SharedAccount:
                 reason = "daily_entry_slots"
             elif held and self.frozen.protocol.trading.repeat_signal_policy == "ignore_while_open":
                 reason = "repeat_signal_while_open"
+            elif pending and self.frozen.protocol.trading.repeat_signal_policy == "ignore_while_open":
+                reason = "repeat_signal_pending_entry"
             elif bar is None or bar.close is None or bar.price_basis != "raw" or state is None:
                 reason = "missing_signal_close_or_state"
             elif not state.listed or state.suspended or bar.status != "trading":
@@ -490,6 +526,26 @@ class _SharedAccount:
                 cash_budget=float(budget if accepted else 0),
                 status="pending" if accepted else "rejected", reason=reason, attempt_count=0,
             ))
+
+    def _unexitable_value(self, session: date) -> Decimal:
+        value = Decimal(0)
+        for lot in self.lots.values():
+            if not lot.quantity:
+                continue
+            state = self.snapshot.state_at(lot.signal.symbol, session)
+            bar = self._bar(lot.signal.symbol, session)
+            unavailable = (
+                bool(lot.exit_reasons) or lot.entry_date == session or state is None
+                or not state.listed or state.suspended or state.limit_rule == "unknown"
+                or bar is None or bar.status != "trading"
+            )
+            if state is not None and bar is not None and state.limit_rule == "bounded":
+                unavailable = unavailable or state.limit_down is None or bar.open is None or (
+                    bar.open <= state.limit_down
+                )
+            if unavailable:
+                value += lot.last_market_value
+        return value
 
     def _trades(self) -> tuple[PortfolioTrade, ...]:
         return tuple(PortfolioTrade(
@@ -560,9 +616,11 @@ class _SharedAccount:
             execution_policy_id=self.execution.policy_id, selection_policy_id=self.selection.policy_id,
             evidence_kind=self.snapshot.manifest.evidence_kind,
             data_qualified=audit.status == "qualified" and not self.reasons,
+            execution_qualified=not self.execution_reasons,
+            execution_reasons=tuple(dict.fromkeys(self.execution_reasons)),
             qualification_reasons=tuple(dict.fromkeys(self.reasons)), initial_capital=capital,
             window=self.window, signals=self.signals, daily_nav=tuple(self.daily),
-            orders=tuple(self.orders), fills=tuple(self.fills), trades=trades, benchmark=(),
+            orders=tuple(self.orders), fills=tuple(self.fills), trades=trades, benchmark=self.benchmark,
             corporate_actions=tuple(self.action_events),
             metrics=PortfolioMetrics(
                 closed_trades=len(pnls), winning_trades=len(wins), losing_trades=len(losses),
@@ -575,10 +633,13 @@ class _SharedAccount:
                 portfolio_net_return=last.nav / capital - 1,
                 annualized_net_return=annualized, max_drawdown=float(max_drawdown),
                 total_costs=sum(day.costs for day in self.daily),
+                benchmark_net_return=self.benchmark[-1].nav / capital - 1 if self.benchmark else None,
                 turnover=sum(fill.gross for fill in self.fills) /
                          (sum(day.nav for day in self.daily) / len(self.daily)),
                 open_positions=len({lot.signal.symbol for lot in self.lots.values() if lot.quantity}),
                 open_exposure=last.open_exposure,
+                unexitable_exposure=float(self._unexitable_value(last.date)) / last.nav
+                if last.nav else 0,
                 unfinished_trades=sum(trade.status == "open" for trade in trades),
             ),
             coverage=PortfolioCoverage(
