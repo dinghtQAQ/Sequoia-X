@@ -360,3 +360,60 @@ def test_selected_window_retains_episode_origin_but_has_no_prior_window_orders(
     assert result.portfolio.signals == result.replay.signals
     assert result.portfolio.fills[0].session == sample.calendar[41]
     assert result.portfolio.daily_nav[-1].nav == 99995
+
+
+@pytest.mark.parametrize(("state_changes", "execution_reason"), [
+    ({}, None),
+    ({"is_st": True, "limit_up": 18.9, "limit_down": 17.1},
+     "risk_warning_rules_not_supported"),
+    ({"board": "UNVERIFIED_BOARD"}, "unsupported_or_unverified_board"),
+    ({"limit_rule": "unbounded", "limit_up": None, "limit_down": None},
+     "unsupported_unbounded_price_limit"),
+], ids=["supported", "st", "unverified-board", "unbounded-limits"])
+def test_unsupported_held_flag_position_retains_pre_maturity_risk(
+    tmp_path, protocol_data, state_changes: dict[str, object], execution_reason: str | None,
+) -> None:
+    from sequoia_x.research.dataset import DatasetSnapshot
+    from sequoia_x.research.flag import run_flag_portfolio
+
+    sample = flag_snapshot(52)
+    data = sample.model_dump()
+    for state in data["states"]:
+        if state["effective_date"] >= sample.calendar[48]:
+            state.update(state_changes)
+    sample = DatasetSnapshot.model_validate(data)
+    frozen, execution, selection = flag_account_inputs(tmp_path, protocol_data, sample)
+    result = run_flag_portfolio(sample, frozen, execution, selection)
+    account = result.portfolio
+
+    # 100 shares enter at 18 plus a 5 cash fee; only 12 sessions have elapsed.
+    entered = [trade for trade in account.trades if trade.entry_date is not None]
+    assert len(entered) == 1
+    assert entered[0].entry_date == sample.calendar[40]
+    assert entered[0].status == "open"
+    assert entered[0].remaining_quantity == 100
+    assert entered[0].exit_date is None
+    assert all(order.side == "buy" for order in account.orders)
+    assert account.daily_nav[-1].cash == 98195
+    assert account.daily_nav[-1].market_value == 1800
+    assert account.daily_nav[-1].nav == 99995
+    assert account.metrics.total_costs == 5
+    assert account.metrics.closed_trades == 0
+    assert account.metrics.net_win_rate is account.metrics.net_expectancy is None
+    assert account.metrics.open_exposure == pytest.approx(1800 / 99995)
+    # The 40-session momentum window retains the early low through session 48.
+    assert result.replay.coverage.formed_observations == 10
+    assert result.replay.coverage.episode_count == 1
+    assert account.signals == result.replay.signals
+
+    if execution_reason is None:
+        assert account.execution_qualified is True
+        assert account.execution_reasons == ()
+        assert account.metrics.unexitable_exposure == 0
+    else:
+        assert account.metrics.unexitable_exposure == pytest.approx(1800 / 99995)
+        assert account.execution_qualified is False
+        assert any(
+            reason.rsplit(":", 1)[-1] == execution_reason
+            for reason in account.execution_reasons
+        )
