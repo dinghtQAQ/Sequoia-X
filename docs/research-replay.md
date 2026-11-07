@@ -8,7 +8,7 @@
 - `replay_ma_signals(snapshot, through=None)`：复用恢复版的 MA5/MA20 严格金叉和当日量大于含当日 20 日均量的 1.5 倍。指标可消费研究开始日前预热，但只返回声明研究区间内信号。`Signal` 保留证券、信号日、策略、特征和可选 episode；`signal_id` 由规范内容确定。
 - `quote_open_fill(bar, state, side, quantity, available_cash, policy, acquired_on=None, used_volume=0)`：供单笔和组合共用的开盘成交原语；无成交也返回原因。买入按整手，卖出完整余股允许不足一手，部分卖出仍按整手。证券的显式当日数量单位及限价来自数据样本，不从今天的规则猜历史限制。
 - `apply_corporate_actions(snapshot, symbol, session, quantity, receivables=())`：每日开盘前对前一日持仓调用一次；每个信号 lot 分开持有应收。除权日登记每原股税后现金权益及支持的数量变化，到账日前不能把应收当可用现金。持仓已卖清后仍传入该 lot 的应收，到账后返回的应收列表会移除该项。重复应收、非整数股处置和同日多个未合并股数变化明确报错或保留阻断原因。
-- `mark_position(snapshot, symbol, session, quantity)`：用原始市场收盘价估值，缺价可携带最后已知市场价格和日期；跨公司行动缺价返回 `unreliable`、`value=None`，不按买入成本或旧价乘新股数制造价值。
+- `mark_position(snapshot, symbol, session, quantity)`：用有成交量的可交易原始市场收盘价估值，停牌行携带的旧报价不当作新市场价格；缺价可携带最后已知市场价格和日期；跨公司行动缺价返回 `unreliable`、`value=None`，不按买入成本或旧价乘新股数制造价值。
 - `replay_trade(snapshot, frozen, signal, quantity, policy, through=None, cancel_entry_on=None)`：一个明确提供的信号生成订单、成交、公司行动、每日现金/持仓/应收/净值和净盈亏。MA 信号应由 `replay_ma_signals` 生成；显式传入的测试信号不自行证明 MA 条件成立。
 
 上述 keyword 参数需按函数签名使用（`quote_open_fill` 的 `acquired_on/used_volume`、重放的 `through/cancel_entry_on` 为 keyword-only）。

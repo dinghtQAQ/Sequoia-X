@@ -325,7 +325,9 @@ def mark_position(
         if item.symbol == symbol
         and item.price_basis == "raw"
         and item.close is not None
-        and item.status in ("trading", "suspended")
+        and item.status == "trading"
+        and item.volume is not None
+        and item.volume > 0
     ]
     if not prices:
         return PositionMark(
