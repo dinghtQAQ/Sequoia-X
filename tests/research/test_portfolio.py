@@ -907,3 +907,172 @@ def test_pay_date_cash_cannot_pre_fund_auction_sale_fees(
     assert result.trades[0].exit_cash == -10001
     assert result.trades[0].net_pnl == -10901
     assert result.daily_nav[-1].cash == result.daily_nav[-1].nav == 99
+
+
+@pytest.mark.parametrize(
+    "state_change,reason",
+    [
+        ({"is_st": True, "limit_up": 10.5, "limit_down": 9.5},
+         "risk_warning_rules_not_supported"),
+        ({"board": "UNKNOWN"}, "unsupported_or_unverified_board"),
+        ({"limit_rule": "unbounded", "limit_up": None, "limit_down": None},
+         "unsupported_unbounded_price_limit"),
+        ({"lot_size": 200}, "unsupported_quantity_unit"),
+        ({"limit_rule": "unknown", "limit_up": None, "limit_down": None},
+         "unknown_price_limit_rule"),
+    ],
+)
+def test_position_becoming_unsupported_before_time_exit_retains_exit_risk(
+    tmp_path: Path,
+    protocol_data: dict,
+    state_change: dict,
+    reason: str,
+) -> None:
+    from sequoia_x.research.portfolio import PortfolioPolicy, run_portfolio
+    from sequoia_x.research.replay import Signal
+
+    sample = _sample(
+        sessions=10,
+        symbols=("AAA",),
+        state_changes={(index, "AAA"): state_change for index in (8, 9)},
+    )
+    execution = _execution()
+    selection = PortfolioPolicy(daily_entry_slots=1, selection="symbol_order", seed=7)
+    frozen = _frozen(
+        tmp_path, protocol_data, sample, execution, selection,
+        initial_capital=11000, max_position_fraction=1,
+    )
+
+    result = run_portfolio(
+        sample, frozen, execution, selection,
+        signals=(Signal(symbol="AAA", signal_date=sample.calendar[0]),),
+        benchmark={day: 11000 for day in sample.calendar},
+    )
+
+    assert result.trades[0].remaining_quantity == 1000
+    assert result.trades[0].status == "open"
+    assert result.trades[0].net_pnl is None
+    assert result.daily_nav[-1].market_value == 10000
+    assert result.daily_nav[-1].nav == 11000
+    assert result.metrics.unexitable_exposure == pytest.approx(10000 / 11000)
+    assert result.execution_qualified is False
+    assert any(reason in item for item in result.execution_reasons)
+    assert any(reason in item for item in result.qualification_reasons)
+    assert len(result.orders) == len(result.fills) == 1
+    assert result.fills[0].side == "buy"
+
+
+@pytest.mark.parametrize(
+    "sessions,state_change,bar_change,market,nav,blocked_value",
+    [
+        (10, {}, {}, 10000, 11000, 0),
+        (2, {}, {}, 10000, 11000, 10000),  # Entry-day T+1 remains a modelled restriction.
+        (10, {"suspended": True},
+         {"status": "suspended", "open": None, "high": None, "low": None,
+          "close": None, "volume": 0}, 10000, 11000, 10000),
+        (10, {}, {"open": 9, "high": 9, "low": 9, "close": 9}, 9000, 10000, 9000),
+        (10, {}, {"volume": 500}, 10000, 11000, 5000),
+    ],
+)
+def test_exit_preview_preserves_modelled_restrictions_and_real_ledger(
+    tmp_path: Path,
+    protocol_data: dict,
+    sessions: int,
+    state_change: dict,
+    bar_change: dict,
+    market: int,
+    nav: int,
+    blocked_value: int,
+) -> None:
+    from sequoia_x.research.portfolio import PortfolioPolicy, run_portfolio
+    from sequoia_x.research.replay import Signal
+
+    sample = _sample(
+        sessions=sessions,
+        symbols=("AAA",),
+        state_changes={(sessions - 1, "AAA"): state_change},
+        changes={(sessions - 1, "AAA"): bar_change},
+    )
+    execution = _execution()
+    selection = PortfolioPolicy(daily_entry_slots=1, selection="symbol_order", seed=7)
+    frozen = _frozen(
+        tmp_path, protocol_data, sample, execution, selection,
+        initial_capital=11000, max_position_fraction=1,
+    )
+
+    result = run_portfolio(
+        sample, frozen, execution, selection,
+        signals=(Signal(symbol="AAA", signal_date=sample.calendar[0]),),
+        benchmark={day: 11000 for day in sample.calendar},
+    )
+
+    assert result.daily_nav[-1].cash == 1000
+    assert result.daily_nav[-1].market_value == market
+    assert result.daily_nav[-1].nav == nav
+    assert result.trades[0].remaining_quantity == 1000
+    assert result.metrics.unexitable_exposure == pytest.approx(blocked_value / nav)
+    assert result.execution_qualified is True
+    assert result.execution_reasons == ()
+    assert len(result.orders) == len(result.fills) == 1
+    assert result.fills[0].side == "buy"
+
+
+def test_temporary_unsupported_holding_remains_visible_after_state_recovers(
+    tmp_path: Path, protocol_data: dict,
+) -> None:
+    from sequoia_x.research.portfolio import PortfolioPolicy, run_portfolio
+    from sequoia_x.research.replay import Signal
+
+    sample = _sample(
+        sessions=10, symbols=("AAA",),
+        state_changes={(8, "AAA"): {"board": "UNKNOWN"}},
+    )
+    execution = _execution()
+    selection = PortfolioPolicy(daily_entry_slots=1, selection="symbol_order", seed=7)
+    frozen = _frozen(tmp_path, protocol_data, sample, execution, selection)
+
+    result = run_portfolio(
+        sample, frozen, execution, selection,
+        signals=(Signal(symbol="AAA", signal_date=sample.calendar[0]),),
+    )
+
+    assert result.metrics.unexitable_exposure == 0
+    assert result.execution_qualified is False
+    assert any(
+        sample.calendar[8].isoformat() in reason and "unsupported_or_unverified_board" in reason
+        for reason in result.execution_reasons
+    )
+    assert len(result.orders) == len(result.fills) == 1
+
+
+def test_exit_preview_shares_one_symbol_capacity_across_open_lots(
+    tmp_path: Path, protocol_data: dict,
+) -> None:
+    from sequoia_x.research.portfolio import PortfolioPolicy, run_portfolio
+    from sequoia_x.research.replay import Signal
+
+    sample = _sample(
+        sessions=6, symbols=("AAA",), changes={(5, "AAA"): {"volume": 1000}},
+    )
+    execution = _execution()
+    selection = PortfolioPolicy(daily_entry_slots=1, selection="symbol_order", seed=7)
+    frozen = _frozen(
+        tmp_path, protocol_data, sample, execution, selection,
+        initial_capital=33000, max_position_fraction=1,
+        repeat_signal_policy="independent_signal_lots",
+    )
+
+    result = run_portfolio(
+        sample, frozen, execution, selection,
+        signals=tuple(Signal(symbol="AAA", signal_date=sample.calendar[i]) for i in (0, 2)),
+    )
+
+    assert [trade.remaining_quantity for trade in result.trades] == [3000, 200]
+    assert result.daily_nav[-1].cash == 1000
+    assert result.daily_nav[-1].market_value == 32000
+    assert result.daily_nav[-1].nav == 33000
+    # Only 1000 of 3200 shares fit the one shared capacity; neither lot is sold.
+    assert result.metrics.unexitable_exposure == pytest.approx(22000 / 33000)
+    assert result.execution_qualified is True
+    assert len(result.orders) == len(result.fills) == 2
+    assert all(fill.side == "buy" for fill in result.fills)
