@@ -48,3 +48,11 @@ account = result.portfolio
 `coverage.total_observations` 包含预热观察，`pre_window_observations` 单列区间前数量；形成/重复/缺失/预热状态计数和每日候选数仅统计研究窗口。`episode_start_dates` 是研究窗口所见 episode 的真实起源，可能早于窗口开始；它不把跨边界持续形态重新计为新机会。`signal_dates` 是窗口内全部成立日，两者分别输出。
 
 flag 应使用明确登记的自身策略版本与冻结协议；不要将既有 MA 账户改名充作 flag 结果。两者可用同一数据、数值执行政策、中性选择政策、初始资金和窗口分别重放，并比较同一 `PortfolioResult` 口径。窗口末仍持有的交易不参与净胜率，成交量受限、持续重复与无法退出原因仍保留。
+
+## 当前执行支持边界与申报账本
+
+本版公共执行模型只模拟有明确历史双限、100 股数量单位的 `SSE_MAIN` 普通非 ST 股票。未支持板块、ST、无界或未知限制等情形保留拒绝原因，不因 flag 形态成立而绕过执行资格。数据资格与执行资格分别看 `portfolio.data_qualified`、`execution_qualified` 及其原因，均不等于策略收益检验已经通过。
+
+协议的订单时间必须冻结为 `next_session_open_limit`，数值政策必须显式给出 `max_order_quantity`。买单使用事前已知涨停价作为限价，卖单使用事前已知跌停价；先按限价及费用核对可申报数量与冻结资金，再用实际开盘行情作历史模拟匹配。日线成交量只是模拟上界，不能证明开盘实际成交。同批次申报不能预花本轮卖款、当日尚未到账分红或低价成交后的释放资金。
+
+订单及成交分别记录 `requested_quantity`、`submitted_quantity`、`unsubmitted_quantity`、实际 `quantity`、`limit_price`、`reserved_cash` 和 `released_cash`。未申报部分与已申报未成交部分分开，部分成交状态相对于已申报数量。合成测试例中，500 股按 19.8 元限价加 5 元最低费冻结 9,905 元；成交量上界仅容许 100 股以 18 元模拟成交，实际支出 1,805 元，释放 8,100 元。该数值只用于核对测量工具。

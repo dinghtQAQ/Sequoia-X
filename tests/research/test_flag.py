@@ -127,8 +127,11 @@ def flag_snapshot(sessions: int = 42):
         "bars": [dict(symbol="600001", available_on=row["date"], **row)
                  for row in frame.to_dict(orient="records")],
         "states": [dict(symbol="600001", effective_date=day, available_on=day,
-                        listed=True, suspended=False, is_st=False, board="main",
-                        lot_size=100, limit_rule="unbounded") for day in days],
+                        listed=True, suspended=False, is_st=False, board="SSE_MAIN",
+                        lot_size=100, limit_rule="bounded",
+                        limit_up=round(float(frame.iloc[max(i - 1, 0)]["close"]) * 1.1, 2),
+                        limit_down=round(float(frame.iloc[max(i - 1, 0)]["close"]) * 0.9, 2))
+                   for i, day in enumerate(days)],
     })
 
 
@@ -234,7 +237,8 @@ def flag_account_inputs(tmp_path, protocol_data, sample, repeat_policy="ignore_w
     execution = ExecutionPolicy(
         fees=(FeeSchedule(effective_from=date(2020, 1, 1), commission_rate=0,
                           min_commission=5, stamp_tax_rate=0, transfer_fee_rate=0),),
-        slippage_bps=0, max_volume_participation=1, volume_model="daily_volume_upper_bound",
+        max_order_quantity=1_000_000, slippage_bps=0,
+        max_volume_participation=1, volume_model="daily_volume_upper_bound",
     )
     selection = PortfolioPolicy(daily_entry_slots=2, selection="symbol_order", seed=7)
     protocol = ResearchProtocol.model_validate({
@@ -242,7 +246,7 @@ def flag_account_inputs(tmp_path, protocol_data, sample, repeat_policy="ignore_w
         "data_snapshot_id": sample.snapshot_id, "universe": sample.manifest.universe_id,
         "trading": {
             **protocol_data["trading"], "repeat_signal_policy": repeat_policy,
-            "entry_order_time": "signal_next_session_open_day",
+            "entry_order_time": "next_session_open_limit",
             "fees": [f"execution_policy:{execution.policy_id}"],
             "capacity": f"selection_policy:{selection.policy_id}",
         },
@@ -262,7 +266,12 @@ def test_flag_uses_shared_cash_capacity_costs_and_preserves_open_exposure(
     account = result.portfolio
     filled = [item for item in account.fills if item.quantity]
     assert len(filled) == 1
+    assert filled[0].requested_quantity == filled[0].submitted_quantity == 500
+    assert filled[0].unsubmitted_quantity == 0
     assert filled[0].quantity == 100
+    assert filled[0].limit_price == 19.8
+    assert filled[0].reserved_cash == 9905
+    assert filled[0].released_cash == 8100
     assert filled[0].session == sample.calendar[40]
     assert account.daily_nav[-1].cash == 98195
     assert account.daily_nav[-1].market_value == 1800
