@@ -217,6 +217,8 @@ def run_portfolio(
     if signals is None:
         signals = replay_ma_signals(snapshot, through=window.end)
     signals = tuple(signal for signal in signals if window.start <= signal.signal_date <= window.end)
+    if any(signal.signal_date not in calendar for signal in signals):
+        raise ValueError("外部信号日期必须属于重放窗口的全市场交易日历")
     if len({signal.signal_id for signal in signals}) != len(signals):
         raise ValueError("同一 signal_id 不可重复提交")
     reference = _benchmark_series(calendar, benchmark, protocol.trading.initial_capital)
@@ -268,9 +270,6 @@ class _Lot:
     costs: Decimal = Decimal(0)
     receivables: tuple[DividendReceivable, ...] = ()
     last_market_value: Decimal = Decimal(0)
-    last_price: float | None = None
-    last_price_date: date | None = None
-    valuation_status: Literal["current", "stale", "unreliable"] = "current"
     exit_reasons: list[str] = field(default_factory=list)
 
     @property
@@ -343,8 +342,8 @@ class _SharedAccount:
                     "status": "rejected", "reason": "max_positions", "frozen_cash": 0,
                 })
                 continue
-            receivables = sum((_amount(item.amount) for item in self.lots.values()
-                               for item in item.receivables), Decimal(0))
+            receivables = sum((_amount(receivable.amount) for held_lot in self.lots.values()
+                               for receivable in held_lot.receivables), Decimal(0))
             nav = self.cash + receivables + sum(
                 (self._opening_value(item, session) for item in self.lots.values() if item.quantity),
                 Decimal(0),
@@ -369,7 +368,6 @@ class _SharedAccount:
                 lot.costs += costs
                 assert fill.market_price is not None
                 lot.last_market_value = _amount(Decimal(str(fill.market_price)) * fill.quantity)
-                lot.last_price, lot.last_price_date = fill.market_price, session
             reason = fill.reason
             if fill.quantity < order.requested_quantity:
                 reason += ";entry_remainder_expired"
@@ -467,9 +465,6 @@ class _SharedAccount:
             mark = mark_position(self.snapshot, lot.signal.symbol, session, lot.quantity)
             if mark.value is not None:
                 lot.last_market_value = _amount(mark.value)
-            lot.last_price = mark.price
-            lot.last_price_date = mark.as_of
-            lot.valuation_status = mark.status
             if mark.status != "current":
                 flags.append(f"{lot.signal.symbol}:{mark.status}:{mark.reason}")
             positions.append(PortfolioPosition(

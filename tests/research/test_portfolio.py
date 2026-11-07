@@ -496,3 +496,23 @@ def test_unknown_execution_rule_is_visible_separately_from_data_coverage(
     assert any("unknown_price_limit_rule" in reason for reason in result.execution_reasons)
     assert result.trades[0].status == "unfilled"
     assert result.daily_nav[-1].nav == 10000
+
+
+def test_external_signal_on_non_session_is_rejected_without_silent_ledger_loss(
+    tmp_path: Path, protocol_data: dict,
+) -> None:
+    from sequoia_x.research.dataset import DatasetSnapshot
+    from sequoia_x.research.portfolio import PortfolioPolicy, run_portfolio
+    from sequoia_x.research.replay import Signal
+
+    original = _sample()
+    payload = original.model_dump()
+    payload["calendar"] = tuple(day for day in original.calendar if day != date(2024, 1, 3))
+    sample = DatasetSnapshot.model_validate(payload)
+    execution = _execution()
+    selection = PortfolioPolicy(daily_entry_slots=1, selection="symbol_order", seed=7)
+    frozen = _frozen(tmp_path, protocol_data, sample, execution, selection)
+
+    with pytest.raises(ValueError, match="交易日"):
+        run_portfolio(sample, frozen, execution, selection,
+            signals=(Signal(symbol="AAA", signal_date=date(2024, 1, 3)),))
