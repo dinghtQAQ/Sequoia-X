@@ -19,6 +19,7 @@ def policy(**changes):
                 transfer_fee_rate=0.0001,
             ),
         ),
+        max_order_quantity=1_000_000,
         slippage_bps=100,
         max_volume_participation=0.01,
         volume_model="daily_volume_upper_bound",
@@ -29,7 +30,7 @@ def policy(**changes):
 
 def bar(on=date(2025, 1, 6), **changes):
     values = dict(
-        symbol="000001", date=on, available_on=on, open=10, high=12, low=9, close=11, volume=100000
+        symbol="600001", date=on, available_on=on, open=10, high=12, low=9, close=11, volume=100000
     )
     values.update(changes)
     return DailyBar(**values)
@@ -37,13 +38,13 @@ def bar(on=date(2025, 1, 6), **changes):
 
 def state(on=date(2025, 1, 6), **changes):
     values = dict(
-        symbol="000001",
+        symbol="600001",
         effective_date=on,
         available_on=on,
         listed=True,
         suspended=False,
         is_st=False,
-        board="main",
+        board="SSE_MAIN",
         lot_size=100,
         limit_rule="bounded",
         limit_up=12,
@@ -83,7 +84,7 @@ def sample(days, *, bars=None, actions=(), states=None):
             source="hand-worked fixture",
             source_version="v1",
             universe_id="synthetic-single",
-            symbols=("000001",),
+            symbols=("600001",),
             start=days[0],
             end=days[-1],
             as_of=days[-1],
@@ -109,7 +110,7 @@ def test_corporate_action_registers_prior_shares_then_pays_after_sale():
         [date(2025, 1, 6), ex_day, date(2025, 1, 8), pay_day],
         actions=[
             CorporateAction(
-                symbol="000001",
+                symbol="600001",
                 ex_date=ex_day,
                 available_on=date(2025, 1, 6),
                 cash_per_share=1,
@@ -119,18 +120,18 @@ def test_corporate_action_registers_prior_shares_then_pays_after_sale():
             ),
         ],
     )
-    ex_result = apply_corporate_actions(snapshot, "000001", ex_day, 100)
+    ex_result = apply_corporate_actions(snapshot, "600001", ex_day, 100)
     assert ex_result.quantity == 200
     assert ex_result.distribution_accrual == 100
     assert ex_result.withholding_tax == 20
     assert ex_result.cash_delta == 0
     assert ex_result.receivables[0].amount == 100
-    paid = apply_corporate_actions(snapshot, "000001", pay_day, 0, ex_result.receivables)
+    paid = apply_corporate_actions(snapshot, "600001", pay_day, 0, ex_result.receivables)
     assert paid.quantity == 0
     assert paid.cash_delta == 100
     assert paid.distribution_accrual == 0
     assert paid.receivables == ()
-    newcomer = apply_corporate_actions(snapshot, "000001", ex_day, 0)
+    newcomer = apply_corporate_actions(snapshot, "600001", ex_day, 0)
     assert newcomer.quantity == 0
     assert newcomer.receivables == ()
 
@@ -144,7 +145,7 @@ def test_missing_price_keeps_last_market_mark_but_split_without_price_is_unrelia
         last, open=None, high=None, low=None, close=None, volume=None, status="missing"
     )
     snapshot = sample([first, last], bars=[bar(first, close=11), missing_bar])
-    mark = mark_position(snapshot, "000001", last, 100)
+    mark = mark_position(snapshot, "600001", last, 100)
     assert mark.value == 1100
     assert mark.status == "stale"
     assert mark.as_of == first
@@ -152,12 +153,12 @@ def test_missing_price_keeps_last_market_mark_but_split_without_price_is_unrelia
         update={
             "actions": (
                 CorporateAction(
-                    symbol="000001", ex_date=last, available_on=first, share_multiplier=2
+                    symbol="600001", ex_date=last, available_on=first, share_multiplier=2
                 ),
             )
         }
     )
-    mark = mark_position(changed, "000001", last, 200)
+    mark = mark_position(changed, "600001", last, 200)
     assert mark.status == "unreliable"
     assert mark.value is None
 
@@ -196,7 +197,7 @@ def test_ma_replay_matches_restored_daily_strategy_and_future_data_cannot_rewrit
     ]
     snapshot = sample(days, bars=bars)
     signals = replay_ma_signals(snapshot, through=days[21])
-    assert [(item.symbol, item.signal_date) for item in signals] == [("000001", days[21])]
+    assert [(item.symbol, item.signal_date) for item in signals] == [("600001", days[21])]
     full_signals = replay_ma_signals(snapshot)
     assert [item.signal_id for item in full_signals if item.signal_date <= days[21]] == [
         item.signal_id for item in signals
@@ -204,7 +205,7 @@ def test_ma_replay_matches_restored_daily_strategy_and_future_data_cannot_rewrit
 
     class DailySource:
         def get_local_symbols(self):
-            return ["000001"]
+            return ["600001"]
 
         def get_ohlcv(self, symbol):
             return pd.DataFrame(
@@ -223,7 +224,7 @@ def test_ma_replay_matches_restored_daily_strategy_and_future_data_cannot_rewrit
             if item.signal_date == cutoff
         ]
         assert restored == replayed
-    assert list(signal_frame(snapshot, "000001", days[0]).columns) == [
+    assert list(signal_frame(snapshot, "600001", days[0]).columns) == [
         "date",
         "open",
         "high",
@@ -245,7 +246,7 @@ def frozen_for(snapshot, numeric_policy, protocol_data):
         initial_capital=10000,
         max_position_fraction=1,
         fees=[f"execution_policy:{numeric_policy.policy_id}"],
-        entry_order_time="signal_next_session_open_day",
+        entry_order_time="next_session_open_limit",
     )
     return FrozenProtocol(
         protocol_id="test-frozen",
@@ -276,13 +277,13 @@ def test_trade_holds_60_market_sessions_and_preserves_unfinished_exposure(protoc
 
     days = sessions(63)
     bars = [
-        bar(day, open=(12 if i >= 61 else 10), high=13, low=9, close=(12 if i >= 61 else 10))
+        bar(day, open=(12 if i >= 61 else 10), high=12, low=9, close=(12 if i >= 61 else 10))
         for i, day in enumerate(days)
     ]
     snapshot = sample(days, bars=bars)
     numeric_policy = zero_cost_policy()
     frozen = frozen_for(snapshot, numeric_policy, protocol_data)
-    signal = Signal(symbol="000001", signal_date=days[0])
+    signal = Signal(symbol="600001", signal_date=days[0])
     unfinished = replay_trade(snapshot, frozen, signal, 100, numeric_policy, through=days[60])
     assert unfinished.entry_date == days[1]
     assert unfinished.status == "open"
@@ -406,7 +407,7 @@ def test_full_replay_reconciles_split_net_dividend_tax_and_later_payment(protoco
         states=[state(day, limit_down=3) for day in days],
         actions=[
             CorporateAction(
-                symbol="000001",
+                symbol="600001",
                 ex_date=ex_date,
                 available_on=days[25],
                 cash_per_share=1,
@@ -420,7 +421,7 @@ def test_full_replay_reconciles_split_net_dividend_tax_and_later_payment(protoco
     result = replay_trade(
         snapshot,
         frozen_for(snapshot, numeric_policy, protocol_data),
-        Signal(symbol="000001", signal_date=days[0]),
+        Signal(symbol="600001", signal_date=days[0]),
         100,
         numeric_policy,
     )
@@ -458,7 +459,7 @@ def test_incomplete_action_coverage_blocks_trusted_complete_trade_pnl(protocol_d
     result = replay_trade(
         snapshot,
         frozen_for(snapshot, numeric_policy, protocol_data),
-        Signal(symbol="000001", signal_date=days[0]),
+        Signal(symbol="600001", signal_date=days[0]),
         100,
         numeric_policy,
     )
@@ -481,7 +482,7 @@ def test_suspension_counts_toward_60_sessions_and_limit_down_defers_exit(protoco
     snapshot = sample(days, bars=bars, states=states)
     numeric_policy = zero_cost_policy()
     frozen = frozen_for(snapshot, numeric_policy, protocol_data)
-    signal = Signal(symbol="000001", signal_date=days[0])
+    signal = Signal(symbol="600001", signal_date=days[0])
     blocked = replay_trade(snapshot, frozen, signal, 100, numeric_policy, through=days[61])
     assert blocked.status == "exit_blocked"
     assert blocked.quantity == 100
@@ -505,7 +506,7 @@ def test_entry_day_order_expires_and_replay_never_postpones_a_failed_buy(protoco
     result = replay_trade(
         snapshot,
         frozen_for(snapshot, numeric_policy, protocol_data),
-        Signal(symbol="000001", signal_date=days[0]),
+        Signal(symbol="600001", signal_date=days[0]),
         100,
         numeric_policy,
     )
@@ -524,7 +525,7 @@ def test_explicit_entry_cancellation_is_auditable_without_a_fill(protocol_data):
     result = replay_trade(
         snapshot,
         frozen_for(snapshot, numeric_policy, protocol_data),
-        Signal(symbol="000001", signal_date=days[0]),
+        Signal(symbol="600001", signal_date=days[0]),
         100,
         numeric_policy,
         cancel_entry_on=days[1],
@@ -546,7 +547,7 @@ def test_replay_rejects_unbound_numeric_costs_and_contradictory_order_time(proto
     frozen = frozen_for(snapshot, numeric_policy, protocol_data)
     changed = numeric_policy.model_copy(update={"slippage_bps": 10})
     with pytest.raises(ValueError, match="指纹"):
-        replay_trade(snapshot, frozen, Signal(symbol="000001", signal_date=days[0]), 100, changed)
+        replay_trade(snapshot, frozen, Signal(symbol="600001", signal_date=days[0]), 100, changed)
     contradictory = frozen.model_copy(
         update={
             "protocol": frozen.protocol.model_copy(
@@ -562,7 +563,7 @@ def test_replay_rejects_unbound_numeric_costs_and_contradictory_order_time(proto
         replay_trade(
             snapshot,
             contradictory,
-            Signal(symbol="000001", signal_date=days[0]),
+            Signal(symbol="600001", signal_date=days[0]),
             100,
             numeric_policy,
         )
@@ -596,7 +597,7 @@ def test_warmup_prices_are_available_but_warmup_signals_are_not_research_trades(
             )
         }
     )
-    assert len(signal_frame(snapshot, "000001", days[22])) == 23
+    assert len(signal_frame(snapshot, "600001", days[22])) == 23
     assert replay_ma_signals(snapshot) == ()
 
 
@@ -613,7 +614,7 @@ def test_suspended_quote_is_not_a_new_market_price_after_a_share_action():
         ],
         states=[state(first), state(ex_day, suspended=True)],
     )
-    unchanged = mark_position(snapshot, "000001", ex_day, 100)
+    unchanged = mark_position(snapshot, "600001", ex_day, 100)
     assert unchanged.status == "stale"
     assert unchanged.as_of == first
     assert unchanged.value == 1000
@@ -621,11 +622,124 @@ def test_suspended_quote_is_not_a_new_market_price_after_a_share_action():
         update={
             "actions": (
                 CorporateAction(
-                    symbol="000001", ex_date=ex_day, available_on=first, share_multiplier=2
+                    symbol="600001", ex_date=ex_day, available_on=first, share_multiplier=2
                 ),
             )
         }
     )
-    split_mark = mark_position(changed, "000001", ex_day, 200)
+    split_mark = mark_position(changed, "600001", ex_day, 200)
     assert split_mark.status == "unreliable"
     assert split_mark.value is None
+
+
+def test_open_limit_model_refuses_unimplemented_risk_warning_restrictions():
+    result = quote_open_fill(bar(), state(is_st=True), "buy", 100, 2000, zero_cost_policy())
+    assert result.status == "unfilled"
+    assert result.quantity == 0
+    assert result.reason == "risk_warning_rules_not_supported"
+
+
+def test_limit_order_submission_reserves_at_pre_known_limit_and_separates_unsubmitted():
+    numeric_policy = zero_cost_policy()
+    result = quote_open_fill(bar(open=10), state(limit_up=12), "buy", 600, 6000, numeric_policy)
+    assert result.limit_price == 12
+    assert result.requested_quantity == 600
+    assert result.submitted_quantity == 500
+    assert result.unsubmitted_quantity == 100
+    assert result.quantity == 500
+    assert result.status == "filled"
+    assert result.reserved_cash == 6000
+    assert result.cash_delta == -5000
+    assert result.released_cash == 1000
+    capped = quote_open_fill(bar(), state(), "buy", 1_000_100, 20_000_000, numeric_policy)
+    assert capped.quantity == 0
+    assert capped.submitted_quantity == 0
+    assert capped.reason == "order_exceeds_verified_quantity_limit"
+
+
+def test_limit_order_at_open_limit_is_submitted_then_expires_without_fill():
+    result = quote_open_fill(bar(open=12), state(), "buy", 100, 2000, zero_cost_policy())
+    assert result.submitted_quantity == 100
+    assert result.quantity == 0
+    assert result.reserved_cash == 1200
+    assert result.released_cash == 1200
+    assert result.reason == "open_at_limit_up"
+
+
+def test_funding_policy_forbids_pre_spending_auction_proceeds_and_unscheduled_dividends():
+    numeric_policy = zero_cost_policy()
+    assert numeric_policy.sale_proceeds == "available_after_opening_auction"
+    assert numeric_policy.dividend_proceeds == "available_at_session_end"
+    assert numeric_policy.algorithm_version == "daily-open-limit-v1"
+    assert numeric_policy.order_type == "limit_at_verified_session_bounds"
+
+
+def test_single_trade_ledger_keeps_unsubmitted_cash_shortfall_distinct(protocol_data):
+    from sequoia_x.research.replay import Signal, replay_trade
+
+    days = sessions(3)
+    snapshot = sample(days)
+    numeric_policy = zero_cost_policy()
+    frozen = frozen_for(snapshot, numeric_policy, protocol_data)
+    frozen = frozen.model_copy(
+        update={
+            "protocol": frozen.protocol.model_copy(
+                update={
+                    "trading": frozen.protocol.trading.model_copy(
+                        update={"max_position_fraction": 0.6}
+                    ),
+                }
+            )
+        }
+    )
+    result = replay_trade(
+        snapshot, frozen, Signal(symbol="600001", signal_date=days[0]), 600, numeric_policy
+    )
+    assert result.quantity == 500
+    assert len(result.orders) == 1
+    order = result.orders[0]
+    assert order.requested_quantity == 600
+    assert order.quantity == 500
+    assert order.unsubmitted_quantity == 100
+    assert order.filled_quantity == 500
+    assert order.status == "filled"
+    assert order.limit_price == 12
+    assert order.reserved_cash == 6000
+    assert order.released_cash == 1000
+    assert result.daily[-1].cash == 5000
+
+
+@pytest.mark.parametrize(
+    "changes, reason",
+    [
+        ({"board": "main"}, "unsupported_or_unverified_board"),
+        ({"board": "STAR"}, "unsupported_or_unverified_board"),
+        (
+            {"limit_rule": "unbounded", "limit_up": None, "limit_down": None},
+            "unsupported_unbounded_price_limit",
+        ),
+        ({"lot_size": 200}, "unsupported_quantity_unit"),
+    ],
+)
+def test_limit_model_does_not_generalize_to_unverified_markets(changes, reason):
+    result = quote_open_fill(bar(), state(**changes), "buy", 100, 2000, zero_cost_policy())
+    assert result.quantity == 0
+    assert result.submitted_quantity == 0
+    assert result.reason == reason
+
+
+def test_raw_prices_outside_verified_daily_limits_cannot_create_fills_or_nav():
+    from sequoia_x.research.replay import mark_position
+
+    on = date(2025, 1, 6)
+    bad = bar(on, open=10, high=100, low=9, close=100)
+    known = state(on, limit_down=9, limit_up=11)
+    attempt = quote_open_fill(bad, known, "buy", 100, 2000, zero_cost_policy())
+    assert attempt.submitted_quantity == 100
+    assert attempt.quantity == 0
+    assert attempt.reason == "raw_prices_outside_verified_price_limits"
+    snapshot = sample([on], bars=[bad], states=[known])
+    mark = mark_position(snapshot, "600001", on, 100)
+    assert mark.status == "unreliable"
+    assert mark.value is None
+    assert mark.reason == "market_close_outside_verified_price_limits"
