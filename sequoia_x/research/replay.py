@@ -661,8 +661,6 @@ def replay_trade(
         )
         remaining = adjusted.quantity
         receivables = adjusted.receivables
-        cash += _decimal(adjusted.cash_delta)
-        paid += _decimal(adjusted.cash_delta)
         accrual += _decimal(adjusted.distribution_accrual)
         withholding += _decimal(adjusted.withholding_tax)
         costs += _decimal(adjusted.withholding_tax)
@@ -740,6 +738,9 @@ def replay_trade(
                         reason="unfilled_day_order_remainder_expires",
                     )
                 )
+        # 仅有 pay_date 的现金在本日开盘匹配之后才可用，不能垫同批卖单费用。
+        cash += _decimal(adjusted.cash_delta)
+        paid += _decimal(adjusted.cash_delta)
         mark = mark_position(snapshot, signal.symbol, session, remaining)
         receivable_value = sum((_decimal(item.amount) for item in receivables), Decimal(0))
         nav = cash + receivable_value + _decimal(mark.value) if mark.value is not None else None
