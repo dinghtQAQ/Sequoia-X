@@ -118,6 +118,12 @@ Sequoia-X/
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
 - **日常增量**：8 进程并行通过 baostock 拉取，2~3 分钟完成全市场更新
 
+## 收益研究协议
+
+收益研究先冻结协议，再登记实验和结果。参见 [研究协议使用说明](docs/research-protocol.md)
+及 [探索模板](examples/research_protocol.json)。经济门槛缺失时只允许探索，
+研究通过状态按历史模拟、纸面交易和真实成交分别记录。
+
 ---
 
 ## 许可证 | License

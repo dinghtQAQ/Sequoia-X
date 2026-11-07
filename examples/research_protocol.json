@@ -1,0 +1,43 @@
+{
+  "study_id": "replace-with-study-id",
+  "hypothesis": "待验证的扣费收益假设；本文件只是探索模板",
+  "strategy_version": "replace-with-code-and-configuration-version",
+  "comparison_version": "replace-with-last-approved-version-or-initial-control",
+  "universe": "待填写历史时点股票池及可复现标识",
+  "data_snapshot_id": "待填写数据来源与快照指纹",
+  "data_cutoff": "2025-12-31",
+  "train": {"start": "2020-01-01", "end": "2022-12-31"},
+  "validation": {"start": "2023-01-01", "end": "2023-12-31"},
+  "final_test": {"start": "2024-01-01", "end": "2025-12-31"},
+  "final_test_status": "unknown",
+  "benchmark": "待填写现金、市场及可比风险暴露参照",
+  "trading": {
+    "initial_capital": 100000,
+    "max_position_fraction": 0.1,
+    "max_positions": 10,
+    "entry_order_time": "待填写信号可知时间、订单提交和实际成交规则",
+    "fees": ["待填写全部适用佣金、最低费用、税费、过户费及生效时间"],
+    "slippage": "待填写滑点模型、参数和压力情景",
+    "capacity": "待填写订单相对成交量限制和流动性约束",
+    "repeat_signal_policy": "ignore_while_open"
+  },
+  "statistics": {
+    "confidence_level": null,
+    "power_target": null,
+    "dependence_method": null,
+    "multiplicity_method": null,
+    "family_id": null,
+    "family_members": [],
+    "review_schedule": null,
+    "test_set_rule": null
+  },
+  "acceptance": {
+    "primary_return": null,
+    "minimum_return_delta": null,
+    "minimum_win_rate": null,
+    "minimum_win_rate_delta": null,
+    "max_drawdown": null,
+    "max_open_exposure": null,
+    "claim": "return_improvement"
+  }
+}

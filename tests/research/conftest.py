@@ -1,0 +1,112 @@
+"""研究协议的外部输入；经济门槛仅为测试值，不是实盘建议。"""
+
+import pytest
+
+
+@pytest.fixture
+def protocol_data() -> dict:
+    return {
+        "study_id": "ma-baseline",
+        "hypothesis": "候选版本在相同资金约束下提高扣费组合收益",
+        "strategy_version": "ma-v1",
+        "comparison_version": "cash-control",
+        "universe": "point-in-time-universe:fixture-v1",
+        "data_snapshot_id": "fixture-prices-v1",
+        "data_cutoff": "2025-12-31",
+        "final_test_status": "untouched",
+        "train": {"start": "2020-01-01", "end": "2022-12-31"},
+        "validation": {"start": "2023-01-01", "end": "2023-12-31"},
+        "final_test": {"start": "2024-01-01", "end": "2025-12-31"},
+        "benchmark": "同日历现金与全收益市场基准",
+        "trading": {
+            "initial_capital": 100000,
+            "max_position_fraction": 0.1,
+            "max_positions": 10,
+            "entry_order_time": "信号次一可交易日开盘；不可成交则不虚构成交",
+            "fees": ["双边佣金含最低费用", "卖出印花税", "双边过户费"],
+            "slippage": "每侧按成交额计 10bp；另做成本压力检验",
+            "capacity": "每单不超过当日成交量的 1%",
+            "repeat_signal_policy": "independent_signal_lots",
+        },
+        "statistics": {
+            "confidence_level": 0.95,
+            "power_target": 0.8,
+            "dependence_method": "按日期分块并保留同日交易聚集",
+            "multiplicity_method": "Holm family-wise adjustment",
+            "family_id": "ma-family-v1",
+            "family_members": ["ma-v1", "ma-v2"],
+            "review_schedule": "最终测试一次；此后只在预定复核点研究新测试数据",
+            "test_set_rule": "single_final_use",
+        },
+        "acceptance": {
+            "primary_return": "portfolio_net_return",
+            "minimum_return_delta": 0.02,
+            "minimum_win_rate": 0.5,
+            "minimum_win_rate_delta": -0.01,
+            "max_drawdown": 0.2,
+            "max_open_exposure": 0.3,
+            "claim": "return_improvement",
+        },
+    }
+
+
+@pytest.fixture
+def evidence_data() -> dict:
+    """人为构造的判据输入，不代表任何市场实验结果。"""
+    return {
+        "data_snapshot_id": "fixture-prices-v1",
+        "evidence_kind": "historical_simulation",
+        "evaluation_window": {"start": "2024-01-01", "end": "2025-12-31"},
+        "candidate_version": "ma-v1",
+        "comparison_version": "cash-control",
+        "primary_return": "portfolio_net_return",
+        "candidate": {
+            "closed_trades": 100,
+            "winning_trades": 60,
+            "losing_trades": 40,
+            "breakeven_trades": 0,
+            "net_win_rate": {"estimate": 0.60, "lower": 0.53, "upper": 0.67},
+            "average_win": 180,
+            "average_loss": -100,
+            "payoff_ratio": 1.8,
+            "net_expectancy": {"estimate": 68, "lower": 10, "upper": 110},
+            "portfolio_net_return": 0.12,
+            "annualized_net_return": 0.06,
+            "max_drawdown": 0.1,
+            "open_exposure": 0.05,
+            "open_positions": 2,
+            "open_valuation": "按可核对价格估值，未平仓盈亏不计入交易胜率",
+            "total_costs": 1000,
+            "sample_coverage": "100笔完整交易；20个信号日；样例覆盖报告",
+        },
+        "comparison": {
+            "closed_trades": 100,
+            "winning_trades": 55,
+            "losing_trades": 45,
+            "breakeven_trades": 0,
+            "net_win_rate": {"estimate": 0.55, "lower": 0.50, "upper": 0.60},
+            "average_win": 140,
+            "average_loss": -100,
+            "payoff_ratio": 1.4,
+            "net_expectancy": {"estimate": 32, "lower": -5, "upper": 70},
+            "portfolio_net_return": 0.07,
+            "annualized_net_return": 0.04,
+            "max_drawdown": 0.12,
+            "open_exposure": 0.04,
+            "open_positions": 1,
+            "open_valuation": "同日历和资金约束估值",
+            "total_costs": 900,
+            "sample_coverage": "100笔完整交易；同日历配对账户",
+        },
+        "net_return_delta": {"estimate": 0.05, "lower": 0.025, "upper": 0.075},
+        "net_win_rate_delta": {"estimate": 0.05, "lower": -0.005, "upper": 0.105},
+        "paired_calendar_and_capital": True,
+        "confidence_level": 0.95,
+        "achieved_power": 0.85,
+        "dependence_method": "按日期分块并保留同日交易聚集",
+        "multiplicity_method": "Holm family-wise adjustment",
+        "family_id": "ma-family-v1",
+        "family_members": ["ma-v1", "ma-v2"],
+        "report_id": "synthetic-report-for-contract-tests-only",
+        "resampling_seed": 42,
+    }
