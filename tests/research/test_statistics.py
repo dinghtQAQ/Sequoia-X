@@ -674,6 +674,172 @@ def test_identical_account_cannot_be_called_a_cost_stress(tmp_path, protocol_dat
     assert any("均未增加" in reason for reason in report.robustness[0].reasons)
 
 
+@pytest.mark.parametrize(("kind", "honest_cost"), [("parameter_neighbor", 5), ("cost_stress", 10)])
+@pytest.mark.parametrize(
+    ("variant", "changed_pool"),
+    [
+        ("removed_all", True),
+        ("removed_one", True),
+        ("added", True),
+        ("date", True),
+        ("symbol", True),
+        ("strategy", True),
+        ("features", True),
+        ("episode", True),
+        ("duplicated", True),
+        ("reordered", False),
+        ("feature_key_reordered", False),
+        ("unchanged", False),
+    ],
+)
+def test_trading_scenarios_keep_the_declared_raw_signal_pool(
+    tmp_path, protocol_data, variant, changed_pool, kind, honest_cost
+):
+    from copy import deepcopy
+
+    from sequoia_x.research.portfolio import run_portfolio
+    from sequoia_x.research.protocol import ResearchProtocol
+    from sequoia_x.research.replay import ExecutionPolicy, Signal
+    from sequoia_x.research.statistics import analyze_baseline
+
+    registry, original, _, _, sample, execution, selection = account_example(
+        tmp_path, protocol_data, sessions=10
+    )
+    fee_values = execution.model_dump(mode="json")
+    fee_values["fees"][0]["min_commission"] = 5
+    execution = ExecutionPolicy.model_validate(fee_values)
+    values = original.protocol.model_dump(mode="json")
+    values.update(study_id="neighbor-signal-pool", comparison_version="neighbor-cash")
+    values["trading"].update(
+        initial_capital=11000,
+        fees=[f"execution_policy:{execution.policy_id}"],
+        repeat_signal_policy="ignore_while_open",
+    )
+    values["statistics"]["family_members"] = [values["strategy_version"], "position-neighbor"]
+    frozen = registry.freeze(ResearchProtocol.model_validate(values))
+    neighbor_values = deepcopy(values)
+    neighbor_values.update(study_id="position-neighbor", strategy_version="position-neighbor")
+    scenario_execution = execution
+    if kind == "parameter_neighbor":
+        neighbor_values["trading"]["max_position_fraction"] = 0.5
+    else:
+        stress_values = execution.model_dump(mode="json")
+        stress_values["fees"][0]["min_commission"] = 10
+        scenario_execution = ExecutionPolicy.model_validate(stress_values)
+        neighbor_values["trading"]["fees"] = [f"execution_policy:{scenario_execution.policy_id}"]
+    neighbor = registry.freeze(ResearchProtocol.model_validate(neighbor_values))
+    cash_values = deepcopy(values)
+    cash_values.update(
+        study_id="neighbor-cash", strategy_version="neighbor-cash", comparison_version="anchor"
+    )
+    cash = registry.freeze(ResearchProtocol.model_validate(cash_values))
+    signals = (
+        Signal(
+            symbol="AAA",
+            signal_date=sample.calendar[0],
+            episode_id="original-episode",
+            features={"alpha": 1.0, "beta": 2.0},
+        ),
+        Signal(symbol="AAA", signal_date=sample.calendar[3], episode_id="original-episode"),
+    )
+    benchmark = {day: 100.0 for day in sample.calendar}
+    candidate = run_portfolio(
+        sample, frozen, execution, selection, signals=signals, benchmark=benchmark
+    )
+    comparison = run_portfolio(sample, cash, execution, selection, signals=(), benchmark=benchmark)
+    variants = {
+        "removed_all": (),
+        "removed_one": signals[1:],
+        "added": signals + (Signal(symbol="AAA", signal_date=sample.calendar[6]),),
+        "date": (signals[0].model_copy(update={"signal_date": sample.calendar[1]}), signals[1]),
+        "symbol": (signals[0].model_copy(update={"symbol": "BBB"}), signals[1]),
+        "strategy": (signals[0].model_copy(update={"strategy": "flag"}), signals[1]),
+        "features": (signals[0].model_copy(update={"features": {"source": 1.0}}), signals[1]),
+        "episode": (signals[0].model_copy(update={"episode_id": "changed-episode"}), signals[1]),
+        "duplicated": signals,
+        "reordered": tuple(reversed(signals)),
+        "feature_key_reordered": (
+            signals[0].model_copy(update={"features": {"beta": 2.0, "alpha": 1.0}}),
+            signals[1],
+        ),
+        "unchanged": signals,
+    }
+    supplied = run_portfolio(
+        sample,
+        neighbor,
+        scenario_execution,
+        selection,
+        signals=variants[variant],
+        benchmark=benchmark,
+    )
+    if variant == "duplicated":
+        # The report boundary must reject multiplicity drift, including a forged ledger.
+        supplied = supplied.model_copy(update={"signals": signals + signals[:1]})
+    honest = run_portfolio(
+        sample, neighbor, scenario_execution, selection, signals=signals, benchmark=benchmark
+    )
+    parameters, reference, sectors, regimes = registered_parameters(
+        candidate, comparison, sample, execution, selection
+    )
+    parameters["statistics_plan"]["scenarios"] = [
+        {
+            "scenario_id": "position-neighbor",
+            "kind": kind,
+            "description": "Only the frozen position fraction or cost multiplier changes",
+            "account": {
+                **parameters["statistics_plan"]["candidate"],
+                "protocol_id": neighbor.protocol_id,
+                "strategy_version": "position-neighbor",
+                "execution_policy_id": scenario_execution.policy_id,
+            },
+            **(
+                {"parameter_changes": {"trading.max_position_fraction": 0.5}}
+                if kind == "parameter_neighbor"
+                else {"cost_multiplier": 2}
+            ),
+        }
+    ]
+    parameters["execution_policies"][scenario_execution.policy_id] = scenario_execution.model_dump(
+        mode="json"
+    )
+    run = registry.start_experiment(
+        frozen.protocol_id,
+        parameters=parameters,
+        stage="final_test",
+        purpose="exploration",
+        evidence_kind="historical_simulation",
+    )
+    report = analyze_baseline(
+        registry,
+        run.experiment_id,
+        candidate,
+        comparison,
+        snapshot=sample,
+        market_reference=reference,
+        exposure_reference=reference,
+        sector_map=sectors,
+        regime_map=regimes,
+        scenarios={"position-neighbor": supplied},
+    )
+    # Each honest account pays the same minimum commission, regardless of share count.
+    assert candidate.metrics.total_costs == 5
+    assert honest.metrics.total_costs == honest_cost
+    assert candidate.metrics.portfolio_net_return == pytest.approx(-5 / 11000)
+    assert honest.metrics.portfolio_net_return == pytest.approx(-honest_cost / 11000)
+    if variant == "removed_all":
+        assert supplied.metrics.portfolio_net_return == 0
+        assert report.robustness[0].primary_return_delta == 0
+    if not changed_pool:
+        assert supplied.metrics.total_costs == honest_cost
+        assert report.robustness[0].primary_return_delta == pytest.approx(-honest_cost / 11000)
+        assert any(
+            "未达到预登记净收益增量下限" in reason for reason in report.robustness[0].reasons
+        )
+    assert any("信号池" in reason for reason in report.robustness[0].reasons) is changed_pool
+    assert any("信号池" in reason for reason in report.diagnostic_gaps) is changed_pool
+    assert report.b0_version is None
+
+
 def test_seed_is_reproducible_and_bonferroni_larger_family_widens_intervals():
     days = tuple(date(2024, 1, 1) + timedelta(days=i) for i in range(180))
     returns = (0.001,) * 90 + (-0.0002,) * 90

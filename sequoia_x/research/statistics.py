@@ -971,6 +971,10 @@ def _scenario_change_reasons(
     parameters: dict,
 ) -> tuple[str, ...]:
     reasons = []
+    if Counter(signal.signal_id for signal in scenario.signals) != Counter(
+        signal.signal_id for signal in candidate.signals
+    ):
+        reasons.append("稳健性场景改变了未声明的原始信号池")
     try:
         base = registry.get_protocol(candidate.protocol_id).protocol
         changed = registry.get_protocol(scenario.protocol_id).protocol
@@ -1024,8 +1028,6 @@ def _scenario_change_reasons(
             ):
                 if getattr(changed.trading, field) != getattr(base.trading, field):
                     reasons.append("成本压力改变了资金、持有或重复信号约束")
-            if scenario.signals != candidate.signals:
-                reasons.append("成本压力改变了信号池")
         else:
             supported = {"trading.max_position_fraction", "trading.max_positions"}
             if not set(contract.parameter_changes).issubset(supported):
