@@ -10,7 +10,7 @@
 - `DailyBar` 的 OHLC 是原始市场元/股价格，`volume` 单位为股。`status` 分别记录 `trading`、`suspended`、`missing`、`anomalous`，零量另计。`price_basis` 不是 raw 时禁止获得执行和收益资格。
 - 指标价默认 `raw_as_of`，省略指标四价时复用 raw；显式指标四价必须全部提供。`point_in_time_adjusted` 要求 `indicator_open/high/low/close`、`indicator_available_on` 和 `indicator_source_version`，不接受未来公司行动回填。无法证明历史可知的复权数据标记 `unverified_adjusted`。raw 与恢复版后复权日常输入不同，不能声称真实日常信号已经一致；一致性比较必须使用相同输入口径。
 - `available_on` 是该信息最早可供当日收盘决策使用的日期，只有日期粒度，不能证明某个盘中时刻已经可知。`bars_as_of(on)` 截断原始/指标可知日，并封顶于结束日和数据截至；不能用当日完整成交量、最高/最低价决定当日开盘订单。日线仅供事后保守成交模拟，不能证明实际排队成交。延迟行情不允许反填历史收益资格。
-- `SecurityState(symbol, effective_date, available_on, listed, suspended, is_st, board, lot_size, limit_rule, limit_up, limit_down)` 是精确每日状态；`state_at(symbol, on)` 不延续昨日涨跌停价格。`limit_rule` 默认 unknown，bounded 必须给双限，unbounded 也必须有已核对的适用依据；不按今天规则猜历史限制。当日状态用于开盘执行还需来源证明其事前已知，仅日期粒度不足时只能保守阻断。
+- `SecurityState(symbol, effective_date, available_on, listed, suspended, is_st, board, lot_size, limit_rule, limit_up, limit_down)` 是精确每日状态；`state_at(symbol, on)` 不延续昨日涨跌停价格。`limit_rule` 默认 unknown，bounded 必须给双限，unbounded 也必须有已核对的适用依据；不按今天规则猜历史限制。对交易状态的原始 OHLC，审计逐项检查其位于明确的当日双限内（含边界）；超限行情连同预热输入都会阻断 replay_eligible 和可信数据资格。指标复权价格不套用原始市场双限。当日状态用于开盘执行还需来源证明其事前已知，仅日期粒度不足时只能保守阻断。
 - `CorporateAction` 分开公告可知日 `available_on`、生效日 `ex_date` 和现金实际入账日 `pay_date`。`cash_per_share` 是每原股税后实收现金，`withholding_tax_per_share` 单列已扣税，毛额为两者之和；`share_multiplier` 是生效后/生效前股数比例。除权日开盘前持仓登记权益，除权日买入没有该次权益，现金到 pay_date 才可用。仅支持该明确事件模型；配股、延后上市送股、无法确定持有期扣税或缺事件数据时不得声明完整。`action_id` 是不含公告可知日的经济事件指纹，重复事件阻断，避免重复收益。同证券同生效日多条记录缺少独立事件/修订身份时一律阻断；不能把公告修订值当两笔分红，也不支持猜测同日独立事件。
 
 ## 公开调用

@@ -270,6 +270,17 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
                 or state.limit_down >= state.limit_up
             ):
                 reasons.append(f"涨跌停价格缺失或异常：{label}")
+            if (
+                state.limit_rule == "bounded"
+                and state.limit_down is not None
+                and state.limit_up is not None
+                and bar.status == "trading"
+                and any(
+                    price is not None and not state.limit_down <= price <= state.limit_up
+                    for price in (bar.open, bar.high, bar.low, bar.close)
+                )
+            ):
+                reasons.append(f"原始OHLC超出当日涨跌停价格：{label}")
             if (not state.listed or state.suspended) and bar.status == "trading" and bar.volume:
                 reasons.append(f"上市/停牌状态与可交易行情冲突：{label}")
             if bar.status == "suspended" and not state.suspended:
