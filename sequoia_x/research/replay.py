@@ -34,13 +34,16 @@ class FeeSchedule(FrozenModel):
 
 
 class ExecutionPolicy(FrozenModel):
-    algorithm_version: Literal["daily-open-v1"] = "daily-open-v1"
+    algorithm_version: Literal["daily-open-limit-v1"] = "daily-open-limit-v1"
+    order_type: Literal["limit_at_verified_session_bounds"] = "limit_at_verified_session_bounds"
     fees: tuple[FeeSchedule, ...] = Field(min_length=1)
+    max_order_quantity: int = Field(gt=0, le=1_000_000)
     slippage_bps: float = Field(ge=0, lt=10000)
     max_volume_participation: float = Field(gt=0, le=1)
     volume_model: Literal["daily_volume_upper_bound"]
     entry_tif: Literal["next_session_day"] = "next_session_day"
-    sale_proceeds: Literal["available_for_same_session_buys"] = "available_for_same_session_buys"
+    sale_proceeds: Literal["available_after_opening_auction"] = "available_after_opening_auction"
+    dividend_proceeds: Literal["available_at_session_end"] = "available_at_session_end"
 
     @model_validator(mode="after")
     def ordered_fees(self) -> "ExecutionPolicy":
@@ -58,11 +61,8 @@ def validate_execution_policy(frozen: FrozenProtocol, policy: ExecutionPolicy) -
     """数值模型必须先由协议精确引用；不解释自然语言成本。"""
     if f"execution_policy:{policy.policy_id}" not in frozen.protocol.trading.fees:
         raise ValueError("冻结协议未精确绑定 execution_policy 指纹；请先登记数值执行模型再冻结")
-    if frozen.protocol.trading.entry_order_time not in (
-        "signal_next_session_open_day",
-        f"execution_policy:{policy.policy_id}",
-    ):
-        raise ValueError("冻结协议订单时点与支持的信号次一市场交易日开盘 DAY 订单不符")
+    if frozen.protocol.trading.entry_order_time != "next_session_open_limit":
+        raise ValueError("冻结协议订单时点必须为 next_session_open_limit；旧市价协议须新建版本")
 
 
 class FillAttempt(FrozenModel):
@@ -70,7 +70,15 @@ class FillAttempt(FrozenModel):
     symbol: str
     side: Side
     requested_quantity: int
+    submitted_quantity: int = 0
+    unsubmitted_quantity: int = 0
     quantity: int = 0
+    order_type: Literal["limit_at_verified_session_bounds"] = "limit_at_verified_session_bounds"
+    limit_price: float | None = None
+    reserved_cash: float = 0
+    released_cash: float = 0
+    reserved_quantity: int = 0
+    released_quantity: int = 0
     market_price: float | None = None
     price: float | None = None
     gross: float = 0
@@ -94,64 +102,123 @@ def quote_open_fill(
     acquired_on: date | None = None,
     used_volume: int = 0,
 ) -> FillAttempt:
-    """模拟开盘市价成交。日成交量仅是事后模拟上界，不声称开盘流动性可知。"""
-    if side not in ("buy", "sell") or quantity <= 0 or used_volume < 0:
-        raise ValueError("订单方向、数量或已使用成交量无效")
-    if available_cash < 0:
-        raise ValueError("可用现金不能为负")
+    """事前边界限价 DAY 单；先核申报冻结，再用日线作保守的事后匹配。"""
+    if side not in ("buy", "sell") or not isinstance(quantity, int) or quantity <= 0:
+        raise ValueError("订单方向或数量无效")
+    if used_volume < 0 or available_cash < 0:
+        raise ValueError("已使用成交量或可用现金不能为负")
+    session = bar.date if bar else (state.effective_date if state else None)
     base = FillAttempt(
-        session=bar.date if bar else None,
+        session=session,
         symbol=bar.symbol if bar else (state.symbol if state else "unknown"),
         side=side,
         requested_quantity=quantity,
-        reason="pending",
+        unsubmitted_quantity=quantity,
+        reason="not_submitted",
     )
 
     def reject(reason: str) -> FillAttempt:
         return base.model_copy(update={"reason": reason})
 
-    if bar is None or state is None:
+    if state is None or session is None:
         return reject("missing_bar_or_state")
-    if state.symbol != bar.symbol or state.effective_date != bar.date:
+    if state.effective_date != session or (bar is not None and state.symbol != bar.symbol):
         return reject("state_date_or_symbol_mismatch")
-    if bar.available_on > bar.date:
-        return reject("execution_bar_not_available_on_session")
-    if state.available_on > bar.date:
+    if state.available_on > session:
         return reject("state_not_yet_known")
-    if not state.listed or state.suspended or bar.status != "trading":
+    if not state.listed or state.suspended:
         return reject("not_tradable")
     if state.is_st:
-        return reject("risk_warning_stock_requires_unsupported_limit_order")
+        return reject("risk_warning_rules_not_supported")
+    if state.board != "SSE_MAIN":
+        return reject("unsupported_or_unverified_board")
+    if state.lot_size != 100:
+        return reject("unsupported_quantity_unit")
+    if state.limit_rule == "unknown":
+        return reject("unknown_price_limit_rule")
+    if state.limit_rule != "bounded":
+        return reject("unsupported_unbounded_price_limit")
+    if state.limit_up is None or state.limit_down is None or state.limit_down >= state.limit_up:
+        return reject("missing_price_limits")
+    if quantity > min(policy.max_order_quantity, 1_000_000):
+        return reject("order_exceeds_verified_quantity_limit")
+    if side == "sell" and (acquired_on is None or acquired_on >= session):
+        return reject("t_plus_one")
+    applicable = [fee for fee in policy.fees if fee.effective_from <= session]
+    if not applicable:
+        return reject("missing_fee_schedule")
+    fee = applicable[-1]
+    limit = _decimal(state.limit_up if side == "buy" else state.limit_down)
+    if _money(limit) != limit:
+        return reject("unsupported_limit_price_tick")
+
+    def amounts(price: Decimal, shares: int) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
+        gross = _money(price * shares)
+        commission = _money(
+            max(gross * _decimal(fee.commission_rate), _decimal(fee.min_commission))
+        )
+        stamp = _money(gross * _decimal(fee.stamp_tax_rate)) if side == "sell" else Decimal(0)
+        transfer = _money(gross * _decimal(fee.transfer_fee_rate))
+        delta = (
+            -gross - commission - stamp - transfer
+            if side == "buy"
+            else (gross - commission - stamp - transfer)
+        )
+        return gross, commission, stamp, transfer, delta
+
+    submitted = quantity
+    reserved_cash = Decimal(0)
+    if side == "buy":
+        lot = state.lot_size
+        cash_cap = int((_decimal(available_cash) / limit).to_integral_value(rounding=ROUND_DOWN))
+        submitted = min(quantity // lot * lot, cash_cap // lot * lot)
+        while submitted > 0:
+            reserved_cash = -amounts(limit, submitted)[-1]
+            if reserved_cash <= _decimal(available_cash):
+                break
+            submitted -= lot
+        if submitted <= 0:
+            return reject("insufficient_cash_at_limit_or_lot")
+    base = base.model_copy(
+        update={
+            "submitted_quantity": submitted,
+            "unsubmitted_quantity": quantity - submitted,
+            "limit_price": float(limit),
+            "reserved_cash": float(reserved_cash),
+            "released_cash": float(reserved_cash),
+            "reserved_quantity": submitted if side == "sell" else 0,
+            "released_quantity": submitted if side == "sell" else 0,
+        }
+    )
+    # 以上决定仅用事前状态、限价、费率和可用预算，不能倒用日线 open/volume。
+    if bar is None:
+        return reject("missing_bar_or_state")
+    if bar.available_on > session:
+        return reject("execution_bar_not_available_on_session")
+    if bar.status != "trading":
+        return reject("not_tradable")
     if bar.price_basis != "raw":
         return reject("execution_requires_raw_price")
     if bar.open is None or bar.high is None or bar.low is None or bar.volume is None:
         return reject("missing_execution_data")
-    if bar.open <= 0 or bar.volume <= 0 or not bar.low <= bar.open <= bar.high:
+    if bar.volume <= 0 or not bar.low <= bar.open <= bar.high:
         return reject("invalid_execution_data")
-    if state.limit_rule == "unknown":
-        return reject("unknown_price_limit_rule")
-    if state.limit_rule == "bounded":
-        if state.limit_up is None or state.limit_down is None:
-            return reject("missing_price_limits")
-        if side == "buy" and bar.open >= state.limit_up:
-            return reject("open_at_limit_up")
-        if side == "sell" and bar.open <= state.limit_down:
-            return reject("open_at_limit_down")
-    if side == "sell" and (acquired_on is None or acquired_on >= bar.date):
-        return reject("t_plus_one")
-    applicable = [fee for fee in policy.fees if fee.effective_from <= bar.date]
-    if not applicable:
-        return reject("missing_fee_schedule")
-    fee = applicable[-1]
-    slip = _decimal(policy.slippage_bps) / 10000
+    if any(
+        value is not None and not state.limit_down <= value <= state.limit_up
+        for value in (bar.open, bar.high, bar.low, bar.close)
+    ):
+        return reject("raw_prices_outside_verified_price_limits")
+    if side == "buy" and bar.open >= state.limit_up:
+        return reject("open_at_limit_up")
+    if side == "sell" and bar.open <= state.limit_down:
+        return reject("open_at_limit_down")
     market_price = _decimal(bar.open)
+    slip = _decimal(policy.slippage_bps) / 10000
     price = _money(market_price * (1 + slip if side == "buy" else 1 - slip))
     if price <= 0 or price < _decimal(bar.low) or price > _decimal(bar.high):
         return reject("slipped_price_outside_observed_range")
-    if state.limit_rule == "bounded":
-        assert state.limit_up is not None and state.limit_down is not None
-        if price > _decimal(state.limit_up) or price < _decimal(state.limit_down):
-            return reject("slipped_price_outside_price_limits")
+    if price > _decimal(state.limit_up) or price < _decimal(state.limit_down):
+        return reject("slipped_price_outside_price_limits")
     capacity = (
         int(
             (_decimal(bar.volume) * _decimal(policy.max_volume_participation)).to_integral_value(
@@ -160,53 +227,38 @@ def quote_open_fill(
         )
         - used_volume
     )
-    fill_quantity = min(quantity, max(capacity, 0))
-    lot_size = state.lot_size
-    # 完整清仓可卖不足一手的余股；部分成交仍按整手，避免凭空拆出可售余股。
-    if side == "buy" or fill_quantity < quantity:
-        fill_quantity = fill_quantity // lot_size * lot_size
-    if side == "buy":
-        cash_cap = int((_decimal(available_cash) / price).to_integral_value(rounding=ROUND_DOWN))
-        fill_quantity = min(fill_quantity, cash_cap // lot_size * lot_size)
-
-    def amounts(shares: int) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
-        gross = _money(price * shares)
-        commission = _money(
-            max(gross * _decimal(fee.commission_rate), _decimal(fee.min_commission))
-        )
-        stamp = _money(gross * _decimal(fee.stamp_tax_rate)) if side == "sell" else Decimal(0)
-        transfer = _money(gross * _decimal(fee.transfer_fee_rate))
-        cash_delta = (
-            -gross - commission - stamp - transfer
-            if side == "buy"
-            else (gross - commission - stamp - transfer)
-        )
-        return gross, commission, stamp, transfer, cash_delta
-
-    while fill_quantity > 0:
-        gross, commission, stamp, transfer, delta = amounts(fill_quantity)
-        if _decimal(available_cash) + delta >= 0:
-            return FillAttempt(
-                session=base.session,
-                symbol=base.symbol,
-                side=side,
-                requested_quantity=quantity,
-                quantity=fill_quantity,
-                market_price=float(market_price),
-                price=float(price),
-                gross=float(gross),
-                commission=float(commission),
-                stamp_tax=float(stamp),
-                transfer_fee=float(transfer),
-                slippage_cost=float(_money(abs(price - market_price) * fill_quantity)),
-                cash_delta=float(delta),
-                reason="daily_volume_is_simulation_upper_bound",
-                status="filled" if fill_quantity == quantity else "partial",
-            )
-        if side == "sell":
-            break
-        fill_quantity -= lot_size
-    return reject("insufficient_cash_or_capacity_or_lot")
+    filled = min(submitted, max(capacity, 0))
+    if side == "buy" or filled < submitted:
+        filled = filled // state.lot_size * state.lot_size
+    if filled <= 0:
+        return reject("insufficient_capacity_or_lot")
+    gross, commission, stamp, transfer, delta = amounts(price, filled)
+    if _decimal(available_cash) + delta < 0:
+        return reject("insufficient_cash_for_execution_costs")
+    return FillAttempt(
+        session=session,
+        symbol=bar.symbol,
+        side=side,
+        requested_quantity=quantity,
+        submitted_quantity=submitted,
+        unsubmitted_quantity=quantity - submitted,
+        quantity=filled,
+        limit_price=float(limit),
+        reserved_cash=float(reserved_cash),
+        released_cash=float(reserved_cash + delta) if side == "buy" else 0,
+        reserved_quantity=submitted if side == "sell" else 0,
+        released_quantity=submitted - filled if side == "sell" else 0,
+        market_price=float(market_price),
+        price=float(price),
+        gross=float(gross),
+        commission=float(commission),
+        stamp_tax=float(stamp),
+        transfer_fee=float(transfer),
+        slippage_cost=float(_money(abs(price - market_price) * filled)),
+        cash_delta=float(delta),
+        reason="daily_volume_is_simulation_upper_bound",
+        status="filled" if filled == submitted else "partial",
+    )
 
 
 class DividendReceivable(FrozenModel):
@@ -351,6 +403,23 @@ def mark_position(
             reason="corporate_action_since_last_market_close",
         )
     assert last.close is not None
+    known = snapshot.state_at(symbol, last.date)
+    if (
+        known is not None
+        and known.limit_rule == "bounded"
+        and (
+            known.limit_down is None
+            or known.limit_up is None
+            or not known.limit_down <= last.close <= known.limit_up
+        )
+    ):
+        return PositionMark(
+            value=None,
+            price=None,
+            as_of=last.date,
+            status="unreliable",
+            reason="market_close_outside_verified_price_limits",
+        )
     return PositionMark(
         value=float(_money(_decimal(last.close) * quantity)),
         price=last.close,
@@ -471,7 +540,14 @@ def replay_ma_signals(
 class ReplayOrder(FrozenModel):
     session: date | None
     side: Side
+    requested_quantity: int
     quantity: int
+    unsubmitted_quantity: int = 0
+    limit_price: float | None = None
+    reserved_cash: float = 0
+    released_cash: float = 0
+    reserved_quantity: int = 0
+    released_quantity: int = 0
     filled_quantity: int = 0
     status: Literal["pending", "unfilled", "partial", "filled", "expired", "cancelled"]
     reason: str
@@ -563,7 +639,9 @@ def replay_trade(
             ReplayOrder(
                 session=cancel_entry_on,
                 side="buy",
-                quantity=quantity,
+                requested_quantity=quantity,
+                quantity=0,
+                unsubmitted_quantity=quantity,
                 status="cancelled",
                 reason="explicit_entry_cancellation",
             )
@@ -618,7 +696,14 @@ def replay_trade(
                 ReplayOrder(
                     session=session,
                     side=side,
-                    quantity=requested,
+                    requested_quantity=requested,
+                    quantity=attempt.submitted_quantity,
+                    unsubmitted_quantity=attempt.unsubmitted_quantity,
+                    limit_price=attempt.limit_price,
+                    reserved_cash=attempt.reserved_cash,
+                    released_cash=attempt.released_cash,
+                    reserved_quantity=attempt.reserved_quantity,
+                    released_quantity=attempt.released_quantity,
                     filled_quantity=attempt.quantity,
                     status=attempt.status,
                     reason=attempt.reason,
@@ -644,12 +729,13 @@ def replay_trade(
                     exit_cash += _decimal(attempt.cash_delta)
                     if remaining == 0:
                         exit_date = session
-            if side == "buy" and attempt.quantity < requested:
+            if side == "buy" and attempt.quantity < attempt.submitted_quantity:
                 orders.append(
                     ReplayOrder(
                         session=session,
                         side="buy",
-                        quantity=requested - attempt.quantity,
+                        requested_quantity=attempt.submitted_quantity - attempt.quantity,
+                        quantity=attempt.submitted_quantity - attempt.quantity,
                         status="expired",
                         reason="unfilled_day_order_remainder_expires",
                     )
@@ -675,7 +761,9 @@ def replay_trade(
             ReplayOrder(
                 session=entry_session,
                 side="buy",
-                quantity=quantity,
+                requested_quantity=quantity,
+                quantity=0,
+                unsubmitted_quantity=quantity,
                 status="pending",
                 reason="awaiting_next_session_open",
             )
