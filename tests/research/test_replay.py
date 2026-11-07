@@ -743,3 +743,75 @@ def test_raw_prices_outside_verified_daily_limits_cannot_create_fills_or_nav():
     assert mark.status == "unreliable"
     assert mark.value is None
     assert mark.reason == "market_close_outside_verified_price_limits"
+
+
+def test_future_matching_data_cannot_change_pre_registered_submission_or_reservation():
+    numeric_policy = zero_cost_policy()
+    inputs = [
+        bar(open=10),
+        bar(open=12),
+        bar(volume=0),
+        bar(open=100, high=100, low=100, close=100),
+        None,
+    ]
+    for realized_bar in inputs:
+        attempt = quote_open_fill(realized_bar, state(), "buy", 600, 6000, numeric_policy)
+        assert attempt.limit_price == 12
+        assert attempt.submitted_quantity == 500
+        assert attempt.unsubmitted_quantity == 100
+        assert attempt.reserved_cash == 6000
+    assert quote_open_fill(inputs[0], state(), "buy", 600, 6000, numeric_policy).quantity == 500
+    for realized_bar in inputs[1:]:
+        assert (
+            quote_open_fill(realized_bar, state(), "buy", 600, 6000, numeric_policy).quantity == 0
+        )
+
+
+def test_dividend_paid_at_day_end_cannot_fund_that_opening_exit_fee(protocol_data):
+    from sequoia_x.research.dataset import CorporateAction
+    from sequoia_x.research.replay import Signal, replay_trade
+
+    days = sessions(64)
+    snapshot = sample(
+        days,
+        actions=[
+            CorporateAction(
+                symbol="600001",
+                ex_date=days[30],
+                available_on=days[29],
+                cash_per_share=1,
+                pay_date=days[61],
+            ),
+        ],
+    )
+    numeric_policy = zero_cost_policy().model_copy(
+        update={
+            "fees": (
+                FeeSchedule(
+                    effective_from=days[0],
+                    commission_rate=0,
+                    min_commission=0,
+                    stamp_tax_rate=0,
+                    transfer_fee_rate=0,
+                ),
+                FeeSchedule(
+                    effective_from=days[61],
+                    commission_rate=0,
+                    min_commission=10001,
+                    stamp_tax_rate=0,
+                    transfer_fee_rate=0,
+                ),
+            )
+        }
+    )
+    frozen = frozen_for(snapshot, numeric_policy, protocol_data)
+    signal = Signal(symbol="600001", signal_date=days[0])
+    blocked = replay_trade(snapshot, frozen, signal, 100, numeric_policy, through=days[61])
+    assert blocked.status == "exit_blocked"
+    assert blocked.exit_date is None
+    assert blocked.orders[-1].reason == "insufficient_cash_for_execution_costs"
+    assert blocked.daily[-1].cash == 9100
+    assert blocked.quantity == 100
+    completed = replay_trade(snapshot, frozen, signal, 100, numeric_policy)
+    assert completed.exit_date == days[62]
+    assert completed.daily[-1].cash == 99
