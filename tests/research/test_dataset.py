@@ -6,27 +6,57 @@ from sequoia_x.research.dataset import DatasetSnapshot, audit_dataset
 def sample_data() -> dict:
     return {
         "manifest": {
-            "source": "hand-worked synthetic fixture", "source_version": "1",
-            "universe_id": "fixture-two-securities", "symbols": ["600001"],
-            "start": "2024-01-02", "end": "2024-01-03", "as_of": "2024-01-03",
-            "evidence_kind": "synthetic", "universe_complete": True,
-            "states_complete": True, "actions_complete": True, "calendar_complete": True,
+            "source": "hand-worked synthetic fixture",
+            "source_version": "1",
+            "universe_id": "fixture-two-securities",
+            "symbols": ["600001"],
+            "start": "2024-01-02",
+            "end": "2024-01-03",
+            "as_of": "2024-01-03",
+            "evidence_kind": "synthetic",
+            "universe_complete": True,
+            "states_complete": True,
+            "actions_complete": True,
+            "calendar_complete": True,
         },
         "calendar": ["2024-01-02", "2024-01-03"],
         "bars": [
-            {"symbol": "600001", "date": day, "available_on": day,
-             "open": price, "high": price, "low": price, "close": price, "volume": 10000}
+            {
+                "symbol": "600001",
+                "date": day,
+                "available_on": day,
+                "open": price,
+                "high": price,
+                "low": price,
+                "close": price,
+                "volume": 10000,
+            }
             for day, price in [("2024-01-02", 10), ("2024-01-03", 9)]
         ],
         "states": [
-            {"symbol": "600001", "effective_date": day, "available_on": day,
-             "listed": True, "suspended": False, "is_st": False, "board": "main",
-             "lot_size": 100, "limit_rule": "bounded", "limit_up": 11, "limit_down": 8}
+            {
+                "symbol": "600001",
+                "effective_date": day,
+                "available_on": day,
+                "listed": True,
+                "suspended": False,
+                "is_st": False,
+                "board": "main",
+                "lot_size": 100,
+                "limit_rule": "bounded",
+                "limit_up": 11,
+                "limit_down": 8,
+            }
             for day in ["2024-01-02", "2024-01-03"]
         ],
         "actions": [
-            {"symbol": "600001", "ex_date": "2024-01-03", "available_on": "2024-01-02",
-             "cash_per_share": 1, "pay_date": "2024-01-03"}
+            {
+                "symbol": "600001",
+                "ex_date": "2024-01-03",
+                "available_on": "2024-01-02",
+                "cash_per_share": 1,
+                "pay_date": "2024-01-03",
+            }
         ],
     }
 
@@ -104,3 +134,92 @@ def test_source_record_order_does_not_change_dataset_identity() -> None:
     data["calendar"].reverse()
     data["states"].reverse()
     assert DatasetSnapshot.model_validate(data).snapshot_id == original.snapshot_id
+
+
+def test_existing_adjusted_cache_is_sampled_read_only_and_remains_unqualified(tmp_path) -> None:
+    import sqlite3
+    from datetime import date
+    from hashlib import sha256
+
+    from sequoia_x.research.dataset import sample_sqlite_cache
+
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE stock_daily(symbol,date,open,high,low,close,volume)")
+        connection.executemany(
+            "INSERT INTO stock_daily VALUES (?,?,?,?,?,?,?)",
+            [
+                ("600001", "2024-01-02", 20, 20, 20, 20, 10000),
+                ("600001", "2024-01-03", 20, 20, 20, 20, 0),
+            ],
+        )
+    before = sha256(path.read_bytes()).hexdigest()
+    sample = sample_sqlite_cache(
+        path, ("600001",), date(2024, 1, 2), date(2024, 1, 3), as_of=date(2024, 1, 3)
+    )
+    assert sha256(path.read_bytes()).hexdigest() == before
+    assert sample.manifest.evidence_kind == "observed"
+    assert sample.bars[0].price_basis == "back_adjusted"
+    assert sample.bars[0].close == 20
+    report = audit_dataset(sample)
+    assert report.status == "data_unqualified"
+    assert not report.replay_eligible
+    assert report.zero_volume_sessions == 1
+    assert report.missing_state_sessions == 2
+    assert not sample.manifest.actions_complete
+
+
+def test_adjusted_warmup_and_future_indicator_prices_cannot_escape_audit() -> None:
+    from datetime import date
+
+    data = sample_data()
+    data["manifest"]["start"] = "2024-01-03"
+    data["bars"][0]["price_basis"] = "back_adjusted"
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert not report.replay_eligible
+    assert any("原始" in reason for reason in report.reasons)
+
+    data = sample_data()
+    data["manifest"]["indicator_price_basis"] = "point_in_time_adjusted"
+    data["manifest"]["indicator_source_version"] = "fixture-announcement-v1"
+    data["bars"][0].update(
+        {
+            "indicator_open": 1,
+            "indicator_high": 1,
+            "indicator_low": 1,
+            "indicator_close": 1,
+            "indicator_available_on": "2024-01-04",
+        }
+    )
+    snapshot = DatasetSnapshot.model_validate(data)
+    assert snapshot.bars_as_of(date(2024, 1, 2)) == ()
+    assert not audit_dataset(snapshot).replay_eligible
+
+
+def test_suspension_missing_and_zero_volume_are_separate_states() -> None:
+    data = sample_data()
+    data["states"][0]["suspended"] = True
+    data["bars"][0]["status"] = "suspended"
+    data["bars"][0]["volume"] = 0
+    data["bars"][1]["status"] = "missing"
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert report.bar_counts == {"trading": 0, "suspended": 1, "missing": 1, "anomalous": 0}
+    assert report.zero_volume_sessions == 1
+    assert not report.replay_eligible
+
+
+def test_unknown_delisted_members_are_not_dropped_from_declared_universe() -> None:
+    data = sample_data()
+    data["manifest"]["symbols"].append("600002")
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert report.missing_state_sessions == 2
+    assert report.missing_bar_sessions == 2
+    assert not report.replay_eligible
+
+
+def test_duplicate_actions_are_rejected_before_double_counting_cash() -> None:
+    data = sample_data()
+    data["actions"].append(data["actions"][0].copy())
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert not report.replay_eligible
+    assert any("重复公司行动" in reason for reason in report.reasons)
