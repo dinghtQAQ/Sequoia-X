@@ -223,3 +223,51 @@ def test_duplicate_actions_are_rejected_before_double_counting_cash() -> None:
     report = audit_dataset(DatasetSnapshot.model_validate(data))
     assert not report.replay_eligible
     assert any("重复公司行动" in reason for reason in report.reasons)
+
+
+def test_same_economic_action_with_changed_announcement_is_not_paid_twice() -> None:
+    data = sample_data()
+    data["actions"].append({**data["actions"][0], "available_on": "2024-01-01"})
+    snapshot = DatasetSnapshot.model_validate(data)
+    assert snapshot.actions[0].action_id == snapshot.actions[1].action_id
+    assert not audit_dataset(snapshot).replay_eligible
+
+
+def test_malformed_point_in_time_indicator_ohlc_cannot_qualify() -> None:
+    data = sample_data()
+    data["manifest"]["indicator_price_basis"] = "point_in_time_adjusted"
+    data["manifest"]["indicator_source_version"] = "fixture-indicators"
+    for bar in data["bars"]:
+        bar.update(
+            {
+                "indicator_open": 10,
+                "indicator_high": 1,
+                "indicator_low": 20,
+                "indicator_close": 10,
+                "indicator_available_on": bar["date"],
+            }
+        )
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert not report.replay_eligible
+    assert any("指标OHLC" in reason for reason in report.reasons)
+
+
+def test_warmup_only_sample_cannot_claim_research_window_coverage() -> None:
+    data = sample_data()
+    data["manifest"]["start"] = "2024-01-03"
+    data["calendar"] = data["calendar"][:1]
+    data["bars"] = data["bars"][:1]
+    data["states"] = data["states"][:1]
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert not report.replay_eligible
+    assert any("研究区间没有交易日历" in reason for reason in report.reasons)
+
+
+def test_conflicting_revisions_on_same_ex_date_are_not_independent_distributions() -> None:
+    data = sample_data()
+    data["actions"].append(
+        {**data["actions"][0], "cash_per_share": 2, "available_on": "2024-01-01"}
+    )
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert not report.replay_eligible
+    assert any("同日公司行动" in reason for reason in report.reasons)
