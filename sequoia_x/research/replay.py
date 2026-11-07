@@ -120,6 +120,8 @@ def quote_open_fill(
         return reject("state_not_yet_known")
     if not state.listed or state.suspended or bar.status != "trading":
         return reject("not_tradable")
+    if state.is_st:
+        return reject("risk_warning_stock_requires_unsupported_limit_order")
     if bar.price_basis != "raw":
         return reject("execution_requires_raw_price")
     if bar.open is None or bar.high is None or bar.low is None or bar.volume is None:

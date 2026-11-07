@@ -629,3 +629,10 @@ def test_suspended_quote_is_not_a_new_market_price_after_a_share_action():
     split_mark = mark_position(changed, "000001", ex_day, 200)
     assert split_mark.status == "unreliable"
     assert split_mark.value is None
+
+
+def test_open_market_model_refuses_risk_warning_stock_that_needs_limit_orders():
+    result = quote_open_fill(bar(), state(is_st=True), "buy", 100, 2000, zero_cost_policy())
+    assert result.status == "unfilled"
+    assert result.quantity == 0
+    assert result.reason == "risk_warning_stock_requires_unsupported_limit_order"
