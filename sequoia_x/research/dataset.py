@@ -1,8 +1,10 @@
 """收益重放的只读数据契约；覆盖声明不是收益证明。"""
 
 import json
-from datetime import date
+import sqlite3
+from datetime import date as Date
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 from typing import Literal
 
@@ -13,8 +15,8 @@ from .protocol import FrozenModel
 
 class DailyBar(FrozenModel):
     symbol: str
-    date: date
-    available_on: date
+    date: Date
+    available_on: Date
     open: float | None = Field(default=None, gt=0)
     high: float | None = Field(default=None, gt=0)
     low: float | None = Field(default=None, gt=0)
@@ -26,11 +28,16 @@ class DailyBar(FrozenModel):
     indicator_high: float | None = Field(default=None, gt=0)
     indicator_low: float | None = Field(default=None, gt=0)
     indicator_close: float | None = Field(default=None, gt=0)
-    indicator_available_on: date | None = None
+    indicator_available_on: Date | None = None
 
     @model_validator(mode="after")
     def complete_indicator_prices(self) -> "DailyBar":
-        values = (self.indicator_open, self.indicator_high, self.indicator_low, self.indicator_close)
+        values = (
+            self.indicator_open,
+            self.indicator_high,
+            self.indicator_low,
+            self.indicator_close,
+        )
         if any(value is not None for value in values) and any(value is None for value in values):
             raise ValueError("指标四价必须全部提供或全部省略")
         return self
@@ -40,8 +47,8 @@ class SecurityState(FrozenModel):
     """每日状态；限价是当日显式数据，不能从前日状态延续。"""
 
     symbol: str
-    effective_date: date
-    available_on: date
+    effective_date: Date
+    available_on: Date
     listed: bool
     suspended: bool
     is_st: bool
@@ -56,12 +63,12 @@ class CorporateAction(FrozenModel):
     """公告可知日与除权生效日分离；现金是每原股税后实收，税另列。"""
 
     symbol: str
-    ex_date: date
-    available_on: date
+    ex_date: Date
+    available_on: Date
     cash_per_share: float = Field(default=0, ge=0)
     withholding_tax_per_share: float = Field(default=0, ge=0)
     share_multiplier: float = Field(default=1, gt=0)
-    pay_date: date | None = None
+    pay_date: Date | None = None
 
     @property
     def action_id(self) -> str:
@@ -80,18 +87,18 @@ class DatasetManifest(FrozenModel):
     source_version: str
     universe_id: str
     symbols: tuple[str, ...] = Field(min_length=1)
-    start: date
-    end: date
-    as_of: date
+    start: Date
+    end: Date
+    as_of: Date
     evidence_kind: Literal["synthetic", "observed"]
     universe_complete: bool = False
     states_complete: bool = False
     actions_complete: bool = False
     calendar_complete: bool = False
     price_granularity: Literal["daily"] = "daily"
-    indicator_price_basis: Literal[
-        "raw_as_of", "point_in_time_adjusted", "unverified_adjusted"
-    ] = "raw_as_of"
+    indicator_price_basis: Literal["raw_as_of", "point_in_time_adjusted", "unverified_adjusted"] = (
+        "raw_as_of"
+    )
     indicator_source_version: str | None = None
 
     @field_validator("symbols")
@@ -110,14 +117,14 @@ class DatasetManifest(FrozenModel):
 
 class DatasetSnapshot(FrozenModel):
     manifest: DatasetManifest
-    calendar: tuple[date, ...]
+    calendar: tuple[Date, ...]
     bars: tuple[DailyBar, ...] = ()
     states: tuple[SecurityState, ...] = ()
     actions: tuple[CorporateAction, ...] = ()
 
     @field_validator("calendar")
     @classmethod
-    def ordered_calendar(cls, values: tuple[date, ...]) -> tuple[date, ...]:
+    def ordered_calendar(cls, values: tuple[Date, ...]) -> tuple[Date, ...]:
         if len(set(values)) != len(values):
             raise ValueError("交易日历不能重复")
         return tuple(sorted(values))
@@ -139,22 +146,43 @@ class DatasetSnapshot(FrozenModel):
     @field_validator("actions")
     @classmethod
     def ordered_actions(cls, values: tuple[CorporateAction, ...]) -> tuple[CorporateAction, ...]:
-        return tuple(sorted(values, key=lambda action: (action.ex_date, action.symbol)))
+        return tuple(
+            sorted(values, key=lambda action: (action.ex_date, action.symbol, action.action_id))
+        )
 
     @property
     def snapshot_id(self) -> str:
         # 模型已规范记录顺序；不含读取时间、导出路径等易变信息。
         return "sha256:" + sha256(self.model_dump_json().encode()).hexdigest()
 
-    def bars_as_of(self, on: date) -> tuple[DailyBar, ...]:
-        return tuple(bar for bar in self.bars if bar.date <= on and bar.available_on <= on)
+    def bars_as_of(self, on: Date) -> tuple[DailyBar, ...]:
+        cutoff = min(on, self.manifest.end, self.manifest.as_of)
+        return tuple(
+            bar
+            for bar in self.bars
+            if bar.date <= cutoff
+            and bar.available_on <= cutoff
+            and (bar.indicator_available_on is None or bar.indicator_available_on <= cutoff)
+        )
 
-    def state_at(self, symbol: str, on: date) -> SecurityState | None:
-        return next((state for state in self.states if state.symbol == symbol
-                     and state.effective_date == on and state.available_on <= on), None)
+    def state_at(self, symbol: str, on: Date) -> SecurityState | None:
+        if on > min(self.manifest.end, self.manifest.as_of):
+            return None
+        return next(
+            (
+                state
+                for state in self.states
+                if state.symbol == symbol
+                and state.effective_date == on
+                and state.available_on <= on
+            ),
+            None,
+        )
 
-    def actions_as_of(self, on: date) -> tuple[CorporateAction, ...]:
-        return tuple(action for action in self.actions if action.available_on <= on)
+    def actions_as_of(self, on: Date) -> tuple[CorporateAction, ...]:
+        return tuple(
+            action for action in self.actions if action.available_on <= min(on, self.manifest.as_of)
+        )
 
 
 class DatasetAudit(FrozenModel):
@@ -184,7 +212,7 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
     ):
         if not getattr(manifest, name):
             reasons.append(message)
-    sessions = tuple(day for day in snapshot.calendar if manifest.start <= day <= manifest.end)
+    sessions = tuple(day for day in snapshot.calendar if day <= manifest.end)
     bars = {(bar.symbol, bar.date): bar for bar in snapshot.bars_as_of(manifest.as_of)}
     counts = {name: 0 for name in ("trading", "suspended", "missing", "anomalous")}
     missing_states = missing_bars = zero_volume = 0
@@ -200,19 +228,25 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
                     zero_volume += 1
             elif state is None or (state.listed and not state.suspended):
                 missing_bars += 1
-    scoped_bars = [bar for bar in snapshot.bars
-                   if manifest.start <= bar.date <= manifest.end]
+    scoped_bars = [bar for bar in snapshot.bars if bar.date <= manifest.end]
     for bar in scoped_bars:
         label = f"{bar.symbol}/{bar.date}"
         if bar.symbol not in manifest.symbols or bar.date not in sessions:
             reasons.append(f"行情不在声明股票池或交易日历内：{label}")
+        if bar.available_on > bar.date:
+            reasons.append(f"行情未能在对应交易日可知：{label}")
         if bar.price_basis != "raw":
             reasons.append(f"非原始市场价格不能用于执行和收益核算：{label}")
         if bar.status in ("missing", "anomalous"):
             reasons.append(f"行情明确为{bar.status}：{label}")
         if bar.status == "trading":
-            if (bar.open is None or bar.high is None or bar.low is None
-                or bar.close is None or bar.volume is None):
+            if (
+                bar.open is None
+                or bar.high is None
+                or bar.low is None
+                or bar.close is None
+                or bar.volume is None
+            ):
                 reasons.append(f"交易行情缺少价格或成交量：{label}")
             elif not (bar.low <= bar.open <= bar.high and bar.low <= bar.close <= bar.high):
                 reasons.append(f"行情OHLC关系异常：{label}")
@@ -221,7 +255,8 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
             if state.limit_rule == "unknown":
                 reasons.append(f"涨跌停规则未知：{label}")
             elif state.limit_rule == "bounded" and (
-                state.limit_up is None or state.limit_down is None
+                state.limit_up is None
+                or state.limit_down is None
                 or state.limit_down >= state.limit_up
             ):
                 reasons.append(f"涨跌停价格缺失或异常：{label}")
@@ -231,12 +266,19 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
                 reasons.append(f"停牌行情与证券状态冲突：{label}")
         if manifest.indicator_price_basis == "raw_as_of":
             if bar.indicator_close is not None and (
-                bar.indicator_open, bar.indicator_high, bar.indicator_low, bar.indicator_close
+                bar.indicator_open,
+                bar.indicator_high,
+                bar.indicator_low,
+                bar.indicator_close,
             ) != (bar.open, bar.high, bar.low, bar.close):
                 reasons.append(f"声明原始指标口径却提供不同指标价：{label}")
         elif manifest.indicator_price_basis == "point_in_time_adjusted":
-            if (bar.indicator_close is None or bar.indicator_available_on is None
-                or bar.indicator_available_on > bar.date or not manifest.indicator_source_version):
+            if (
+                bar.indicator_close is None
+                or bar.indicator_available_on is None
+                or bar.indicator_available_on > bar.date
+                or not manifest.indicator_source_version
+            ):
                 reasons.append(f"缺少当时可知的指标价格及来源：{label}")
     if manifest.indicator_price_basis == "unverified_adjusted":
         reasons.append("指标使用未核实的复权口径，不能证明当时可知")
@@ -247,7 +289,7 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
         seen_actions.add(action.action_id)
         if action.symbol not in manifest.symbols:
             reasons.append(f"公司行动不在声明股票池：{action.symbol}")
-        if manifest.start <= action.ex_date <= manifest.end and action.available_on > action.ex_date:
+        if action.ex_date <= manifest.end and action.available_on > action.ex_date:
             reasons.append(f"公司行动未能在生效日可知：{action.symbol}/{action.ex_date}")
     if not sessions:
         reasons.append("研究区间没有交易日历")
@@ -259,17 +301,24 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
     if manifest.evidence_kind == "synthetic":
         reasons.append("synthetic 合成样本仅验证功能，不能用作真实收益证据")
     return DatasetAudit(
-        snapshot_id=snapshot.snapshot_id, evidence_kind=manifest.evidence_kind,
-        status="data_unqualified" if reasons else "qualified", replay_eligible=replay_eligible,
-        reasons=tuple(reasons), bar_counts=counts, missing_state_sessions=missing_states,
-        missing_bar_sessions=missing_bars, zero_volume_sessions=zero_volume,
+        snapshot_id=snapshot.snapshot_id,
+        evidence_kind=manifest.evidence_kind,
+        status="data_unqualified" if reasons else "qualified",
+        replay_eligible=replay_eligible,
+        reasons=tuple(reasons),
+        bar_counts=counts,
+        missing_state_sessions=missing_states,
+        missing_bar_sessions=missing_bars,
+        zero_volume_sessions=zero_volume,
     )
 
 
 def save_sample(snapshot: DatasetSnapshot, path: str | Path) -> str:
     """导出完整输入与指纹；不接触行情数据库。"""
     payload = {"snapshot_id": snapshot.snapshot_id, "snapshot": snapshot.model_dump(mode="json")}
-    Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    Path(path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     return snapshot.snapshot_id
 
 
@@ -279,3 +328,58 @@ def load_sample(path: str | Path) -> DatasetSnapshot:
     if payload["snapshot_id"] != snapshot.snapshot_id:
         raise ValueError("样本指纹不匹配；数据可能被修改")
     return snapshot
+
+
+def sample_sqlite_cache(
+    path: str | Path, symbols: tuple[str, ...], start: Date, end: Date, *, as_of: Date
+) -> DatasetSnapshot:
+    """只读抽取旧 stock_daily；该表固定为后复权，绝不冒充原始价。"""
+    if not symbols or start > end:
+        raise ValueError("必须指定证券和有效日期区间")
+    placeholders = ",".join("?" for _ in symbols)
+    with sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True) as connection:
+        rows = connection.execute(
+            "SELECT symbol,date,open,high,low,close,volume FROM stock_daily "
+            f"WHERE symbol IN ({placeholders}) AND date BETWEEN ? AND ? ORDER BY date,symbol",
+            (*symbols, start.isoformat(), end.isoformat()),
+        ).fetchall()
+    bars = []
+    for symbol, day, *numbers in rows:
+        values = [
+            float(value) if value is not None and isfinite(float(value)) else None
+            for value in numbers
+        ]
+        valid = all(value is not None and value > 0 for value in values[:4])
+        valid = valid and values[4] is not None and values[4] >= 0
+        prices = [value if value is not None and value > 0 else None for value in values[:4]]
+        volume = values[4] if values[4] is not None and values[4] >= 0 else None
+        bars.append(
+            DailyBar(
+                symbol=symbol,
+                date=day,
+                available_on=day,
+                open=prices[0],
+                high=prices[1],
+                low=prices[2],
+                close=prices[3],
+                volume=volume,
+                status="trading" if valid else "anomalous",
+                price_basis="back_adjusted",
+            )
+        )
+    source_version = "sha256:" + sha256(json.dumps(rows, ensure_ascii=False).encode()).hexdigest()
+    return DatasetSnapshot(
+        manifest=DatasetManifest(
+            source="legacy stock_daily / baostock adjustflag=1; read-only extraction",
+            source_version=source_version,
+            universe_id="explicit-symbol-subset-not-historical-universe",
+            symbols=symbols,
+            start=start,
+            end=end,
+            as_of=as_of,
+            evidence_kind="observed",
+            indicator_price_basis="unverified_adjusted",
+        ),
+        calendar=tuple(sorted({bar.date for bar in bars})),
+        bars=tuple(bars),
+    )
