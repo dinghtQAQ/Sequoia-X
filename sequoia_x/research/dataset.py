@@ -72,7 +72,9 @@ class CorporateAction(FrozenModel):
 
     @property
     def action_id(self) -> str:
-        return "sha256:" + sha256(self.model_dump_json().encode()).hexdigest()
+        return (
+            "sha256:" + sha256(self.model_dump_json(exclude={"available_on"}).encode()).hexdigest()
+        )
 
     @model_validator(mode="after")
     def cash_payment_date(self) -> "CorporateAction":
@@ -147,7 +149,15 @@ class DatasetSnapshot(FrozenModel):
     @classmethod
     def ordered_actions(cls, values: tuple[CorporateAction, ...]) -> tuple[CorporateAction, ...]:
         return tuple(
-            sorted(values, key=lambda action: (action.ex_date, action.symbol, action.action_id))
+            sorted(
+                values,
+                key=lambda action: (
+                    action.ex_date,
+                    action.symbol,
+                    action.action_id,
+                    action.available_on,
+                ),
+            )
         )
 
     @property
@@ -274,24 +284,37 @@ def audit_dataset(snapshot: DatasetSnapshot) -> DatasetAudit:
                 reasons.append(f"声明原始指标口径却提供不同指标价：{label}")
         elif manifest.indicator_price_basis == "point_in_time_adjusted":
             if (
-                bar.indicator_close is None
+                bar.indicator_open is None
+                or bar.indicator_high is None
+                or bar.indicator_low is None
+                or bar.indicator_close is None
                 or bar.indicator_available_on is None
                 or bar.indicator_available_on > bar.date
                 or not manifest.indicator_source_version
             ):
                 reasons.append(f"缺少当时可知的指标价格及来源：{label}")
+            elif not (
+                bar.indicator_low <= bar.indicator_open <= bar.indicator_high
+                and bar.indicator_low <= bar.indicator_close <= bar.indicator_high
+            ):
+                reasons.append(f"指标OHLC关系异常：{label}")
     if manifest.indicator_price_basis == "unverified_adjusted":
         reasons.append("指标使用未核实的复权口径，不能证明当时可知")
     seen_actions: set[str] = set()
+    seen_action_days: set[tuple[str, Date]] = set()
     for action in snapshot.actions:
         if action.action_id in seen_actions:
             reasons.append(f"重复公司行动可能重复计入收益：{action.symbol}/{action.ex_date}")
         seen_actions.add(action.action_id)
+        event_day = (action.symbol, action.ex_date)
+        if event_day in seen_action_days:
+            reasons.append(f"同日公司行动缺少独立事件及修订身份：{action.symbol}/{action.ex_date}")
+        seen_action_days.add(event_day)
         if action.symbol not in manifest.symbols:
             reasons.append(f"公司行动不在声明股票池：{action.symbol}")
         if action.ex_date <= manifest.end and action.available_on > action.ex_date:
             reasons.append(f"公司行动未能在生效日可知：{action.symbol}/{action.ex_date}")
-    if not sessions:
+    if not any(manifest.start <= day <= manifest.end for day in sessions):
         reasons.append("研究区间没有交易日历")
     if missing_states:
         reasons.append(f"缺少当时已知的逐日证券状态：{missing_states} 个证券交易日")

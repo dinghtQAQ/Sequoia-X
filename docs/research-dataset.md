@@ -11,7 +11,7 @@
 - 指标价默认 `raw_as_of`，省略指标四价时复用 raw；显式指标四价必须全部提供。`point_in_time_adjusted` 要求 `indicator_open/high/low/close`、`indicator_available_on` 和 `indicator_source_version`，不接受未来公司行动回填。无法证明历史可知的复权数据标记 `unverified_adjusted`。raw 与恢复版后复权日常输入不同，不能声称真实日常信号已经一致；一致性比较必须使用相同输入口径。
 - `available_on` 是该信息最早可供当日收盘决策使用的日期，只有日期粒度，不能证明某个盘中时刻已经可知。`bars_as_of(on)` 截断原始/指标可知日，并封顶于结束日和数据截至；不能用当日完整成交量、最高/最低价决定当日开盘订单。日线仅供事后保守成交模拟，不能证明实际排队成交。延迟行情不允许反填历史收益资格。
 - `SecurityState(symbol, effective_date, available_on, listed, suspended, is_st, board, lot_size, limit_rule, limit_up, limit_down)` 是精确每日状态；`state_at(symbol, on)` 不延续昨日涨跌停价格。`limit_rule` 默认 unknown，bounded 必须给双限，unbounded 也必须有已核对的适用依据；不按今天规则猜历史限制。当日状态用于开盘执行还需来源证明其事前已知，仅日期粒度不足时只能保守阻断。
-- `CorporateAction` 分开公告可知日 `available_on`、生效日 `ex_date` 和现金实际入账日 `pay_date`。`cash_per_share` 是每原股税后实收现金，`withholding_tax_per_share` 单列已扣税，毛额为两者之和；`share_multiplier` 是生效后/生效前股数比例。除权日开盘前持仓登记权益，除权日买入没有该次权益，现金到 pay_date 才可用。仅支持该明确事件模型；配股、延后上市送股、无法确定持有期扣税或缺事件数据时不得声明完整。`action_id` 是事件内容指纹，重复事件阻断，避免重复收益。
+- `CorporateAction` 分开公告可知日 `available_on`、生效日 `ex_date` 和现金实际入账日 `pay_date`。`cash_per_share` 是每原股税后实收现金，`withholding_tax_per_share` 单列已扣税，毛额为两者之和；`share_multiplier` 是生效后/生效前股数比例。除权日开盘前持仓登记权益，除权日买入没有该次权益，现金到 pay_date 才可用。仅支持该明确事件模型；配股、延后上市送股、无法确定持有期扣税或缺事件数据时不得声明完整。`action_id` 是不含公告可知日的经济事件指纹，重复事件阻断，避免重复收益。同证券同生效日多条记录缺少独立事件/修订身份时一律阻断；不能把公告修订值当两笔分红，也不支持猜测同日独立事件。
 
 ## 公开调用
 
@@ -37,4 +37,6 @@ assert load_sample("/tmp/research-sample.json").snapshot_id == sample.snapshot_i
 
 2026-11-07 只读调用现有 baostock，为 `sh.600000` 的 2024-01-02 至 2024-01-05 取得 4 行 `adjustflag=3` 原始行情（字段含 preclose、tradestatus、isST）和 4 个交易日。stock_basic 的上市/退市字段是查询时取得，不能倒填历史可知状态。2024 年 operate 分红返回税后金额字符串“0.2889或0.321”，不是唯一可入账金额；没有替用户选择其中一个。
 
-该观测样本的源响应、带指纹输入和审计报告保存在本次交付 artifacts，真实样本保持 data_unqualified。原因包括历史全集未核实、适用板块和逐日涨跌停缺来源证据、公司行动/税务覆盖不完整、4 日不足预热和完整 60 日交易。测试中手工价格都明确标为 synthetic，不能替代上述真实覆盖。本票交付工程能力与诚实覆盖报告，真实可信收益测量样本的目标如仍缺关键来源应记为 partial，不以代码测试通过关闭该缺口。
+进一步按固定 `sh.600000` / `sh.600112` 和 2024-01-02 至 2024-06-28 窗口取得每股 117 行、共 234 行 raw 行情及 117 个交易 session，长度已覆盖预热和 60 日功能重放。2024-01-02 历史成员查询返回 6529 条证券成员记录，包含这两只证券；stock_basic 另证实 `sh.600112` 后于 2024-08-15 退市，该事后信息未写成研究期内已知退市状态。2024-06-28 历史成员查询最终因连接重置失败；普通客户端此前还记录了超时与接收错误，改用恢复后的有界会话后成功取得长窗口 raw 和起点成员。2023/2024 operate 分红响应未列出窗口内生效事件，但这不证明全部公司行动或税务完整。
+
+观测样本的源响应、带指纹输入和审计报告保存在本次交付 artifacts，真实样本保持 data_unqualified。原因包括逐日历史全集未核实、适用板块和逐日涨跌停缺来源证据、公司行动/税务覆盖不完整；不能因已有足够长度而推定可信收益资格。测试中手工价格都明确标为 synthetic，不能替代上述真实覆盖。本票交付工程能力与诚实覆盖报告，真实可信收益测量样本的目标如仍缺关键来源应记为 partial，不以代码测试通过关闭该缺口。
