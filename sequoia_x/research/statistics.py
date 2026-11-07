@@ -147,22 +147,33 @@ def summarize_dependence(
     def annualized(value: float) -> float:
         return (1 + value) ** (1 / years) - 1
 
-    c_annual, b_annual = annualized(c_return), annualized(b_return)
-    observed = (
-        c_return,
-        b_return,
-        c_return - b_return,
-        c_win,
-        b_win,
-        _difference(c_win, b_win),
-        c_mean,
-        b_mean,
-        _difference(c_mean, b_mean),
-        c_annual,
-        b_annual,
-        c_annual - b_annual,
-    )
-    samples: list[list[float]] = [[] for _ in observed]
+    def measurements(
+        candidate_return: float,
+        comparison_return: float,
+        candidate_win: float | None,
+        comparison_win: float | None,
+        candidate_mean: float | None,
+        comparison_mean: float | None,
+    ) -> dict[str, float | None]:
+        candidate_annual = annualized(candidate_return)
+        comparison_annual = annualized(comparison_return)
+        return {
+            "candidate_return": candidate_return,
+            "comparison_return": comparison_return,
+            "return_delta": candidate_return - comparison_return,
+            "candidate_win_rate": candidate_win,
+            "comparison_win_rate": comparison_win,
+            "win_rate_delta": _difference(candidate_win, comparison_win),
+            "candidate_expectancy": candidate_mean,
+            "comparison_expectancy": comparison_mean,
+            "expectancy_delta": _difference(candidate_mean, comparison_mean),
+            "candidate_annualized_return": candidate_annual,
+            "comparison_annualized_return": comparison_annual,
+            "annualized_return_delta": candidate_annual - comparison_annual,
+        }
+
+    observed = measurements(c_return, b_return, c_win, b_win, c_mean, b_mean)
+    samples: dict[str, list[float]] = {name: [] for name in observed}
     rng = Random(plan.seed)
     for _ in range(plan.resamples):
         indices: list[int] = []
@@ -174,24 +185,10 @@ def summarize_dependence(
         br = prod(1 + comparison_returns[i] for i in indices) - 1
         cw, cm = _trade_stats(pnl_panels[0], indices)
         bw, bm = _trade_stats(pnl_panels[1], indices)
-        ca, ba = annualized(cr), annualized(br)
-        values = (
-            cr,
-            br,
-            cr - br,
-            cw,
-            bw,
-            _difference(cw, bw),
-            cm,
-            bm,
-            _difference(cm, bm),
-            ca,
-            ba,
-            ca - ba,
-        )
-        for bucket, value in zip(samples, values):
+        values = measurements(cr, br, cw, bw, cm, bm)
+        for name, value in values.items():
             if value is not None:
-                bucket.append(value)
+                samples[name].append(value)
     interval_count = family_size * len(observed)
     tail = (1 - confidence_level) / (2 * interval_count)
     reasons = []
@@ -209,42 +206,40 @@ def summarize_dependence(
     if plan.resamples * tail < 2:
         reasons.append("重采样次数不足以分辨校正后区间尾部")
     if any(
-        value is not None and len(bucket) != plan.resamples
-        for value, bucket in zip(observed, samples)
+        value is not None and len(samples[name]) != plan.resamples
+        for name, value in observed.items()
     ):
         reasons.append("部分重采样无完整交易，交易区间不可用于确认性验收")
-    intervals = [_interval(value, bucket, tail) for value, bucket in zip(observed, samples)]
-    assert intervals[0] is not None and intervals[1] is not None and intervals[2] is not None
-    assert intervals[9] is not None and intervals[10] is not None and intervals[11] is not None
-    errors = [stdev(samples[i]) if len(samples[i]) > 1 else None for i in (2, 3, 5, 11)]
-    return DependenceSummary(
-        candidate_return=intervals[0],
-        comparison_return=intervals[1],
-        return_delta=intervals[2],
-        candidate_annualized_return=intervals[9],
-        comparison_annualized_return=intervals[10],
-        annualized_return_delta=intervals[11],
-        candidate_win_rate=intervals[3],
-        comparison_win_rate=intervals[4],
-        win_rate_delta=intervals[5],
-        candidate_expectancy=intervals[6],
-        comparison_expectancy=intervals[7],
-        expectancy_delta=intervals[8],
-        candidate_closed_trades=len(candidate_trades),
-        comparison_closed_trades=len(comparison_trades),
-        date_count=n,
-        independent_block_equivalents=n / plan.block_sessions,
-        return_delta_standard_error=errors[0],
-        win_rate_standard_error=errors[1],
-        win_delta_standard_error=errors[2],
-        annualized_delta_standard_error=errors[3],
-        familywise_interval_count=interval_count,
-        reasons=tuple(reasons),
+    intervals = {name: _interval(value, samples[name], tail) for name, value in observed.items()}
+    errors = {
+        name: stdev(samples[name]) if len(samples[name]) > 1 else None
+        for name in (
+            "return_delta",
+            "candidate_win_rate",
+            "win_rate_delta",
+            "annualized_return_delta",
+        )
+    }
+    return DependenceSummary.model_validate(
+        {
+            **intervals,
+            "candidate_closed_trades": len(candidate_trades),
+            "comparison_closed_trades": len(comparison_trades),
+            "date_count": n,
+            "independent_block_equivalents": n / plan.block_sessions,
+            "return_delta_standard_error": errors["return_delta"],
+            "win_rate_standard_error": errors["candidate_win_rate"],
+            "win_delta_standard_error": errors["win_rate_delta"],
+            "annualized_delta_standard_error": errors["annualized_return_delta"],
+            "familywise_interval_count": interval_count,
+            "reasons": tuple(reasons),
+        }
     )
 
 
 class ExcludedLabel(FrozenModel):
     trade_id: str
+    account: Literal["candidate", "comparison"]
     reason: str
 
 
@@ -300,7 +295,11 @@ def partition_mature_trades(
         if reason is None and stage is not None:
             groups[stage].append(trade)
         else:
-            excluded.append(ExcludedLabel(trade_id=trade.trade_id, reason=reason or "标签不可用"))
+            excluded.append(
+                ExcludedLabel(
+                    trade_id=trade.trade_id, account=trade.account, reason=reason or "标签不可用"
+                )
+            )
     return MaturityPartition(
         train=tuple(groups["train"]),
         validation=tuple(groups["validation"]),
@@ -458,6 +457,7 @@ class PowerMetric(FrozenModel):
 
 class PowerSummary(FrozenModel):
     method: Literal["normal_block_standard_error_v1"] = "normal_block_standard_error_v1"
+    scope: Literal["joint_return_and_win_rate_gates"] = "joint_return_and_win_rate_gates"
     metrics: tuple[PowerMetric, ...]
     achieved_power: float | None
     required_independent_block_equivalents: int | None
@@ -519,12 +519,14 @@ def assess_power(
             alpha = (1 - stats.confidence_level) / summary.familywise_interval_count
             z = NormalDist().inv_cdf(1 - alpha / 2)
             margin = alternative - threshold
-            power = 1 - NormalDist().cdf(z - margin / error) + NormalDist().cdf(-z - margin / error)
+            # 只计向上通过冻结下界门槛的概率；负方向拒绝不属于成功。
+            power = 1 - NormalDist().cdf(z - margin / error)
+            individual_target = 1 - (1 - stats.power_target) / len(tests)
             required = max(
                 1,
                 ceil(
                     summary.independent_block_equivalents
-                    * ((z + NormalDist().inv_cdf(stats.power_target)) * error / margin) ** 2
+                    * ((z + NormalDist().inv_cdf(individual_target)) * error / margin) ** 2
                 ),
             )
             if power < stats.power_target:
@@ -547,9 +549,18 @@ def assess_power(
         for m in metrics
         if m.required_independent_block_equivalents is not None
     ]
+    joint_lower = (
+        max(0.0, 1 - sum(1 - power for power in powers)) if len(powers) == len(metrics) else None
+    )
+    if (
+        joint_lower is not None
+        and stats.power_target is not None
+        and joint_lower < stats.power_target
+    ):
+        reasons.append("收益与胜率全部统计门槛的联合功效保守下界不足")
     return PowerSummary(
         metrics=tuple(metrics),
-        achieved_power=min(powers) if len(powers) == len(metrics) else None,
+        achieved_power=joint_lower,
         required_independent_block_equivalents=max(requirements)
         if len(requirements) == len(metrics)
         else None,
@@ -558,6 +569,9 @@ def assess_power(
 
 
 class AccountStatistics(FrozenModel):
+    raw_trade_count: int
+    raw_closed_trades: int
+    purged_closed_trades: int
     closed_trades: int
     winning_trades: int
     losing_trades: int
@@ -731,7 +745,11 @@ def _account_statistics(
         drawdown = max(drawdown, 1 - day.nav / peak) if peak > 0 else drawdown
     flags = {flag for day in account.daily_nav for flag in day.valuation_flags}
     positives = sorted(wins, reverse=True)
+    raw_closed = sum(t.status == "closed" for t in account.trades)
     result = AccountStatistics(
+        raw_trade_count=len(account.trades),
+        raw_closed_trades=raw_closed,
+        purged_closed_trades=raw_closed - len(pnl),
         closed_trades=len(pnl),
         winning_trades=len(wins),
         losing_trades=len(losses),
@@ -1235,8 +1253,15 @@ def analyze_baseline(
                         reproduce=True,
                     )
                 )
+                scenario_partition = partition_mature_trades(
+                    _closed_trades(account, "candidate"),
+                    protocol,
+                    snapshot.calendar,
+                    as_of=run.used_window.end,
+                    embargo_sessions=plan.embargo_sessions,
+                )
                 scenario_points, _ = _account_statistics(
-                    account, _closed_trades(account, "candidate"), sector_map, regime_map
+                    account, getattr(scenario_partition, run.stage), sector_map, regime_map
                 )
                 primary = protocol.acceptance.primary_return
                 if (

@@ -580,3 +580,120 @@ def test_seed_is_reproducible_and_bonferroni_larger_family_widens_intervals():
     assert family.return_delta.upper >= single.return_delta.upper
     assert family.candidate_win_rate.lower <= single.candidate_win_rate.lower
     assert family.familywise_interval_count == 36
+
+
+def test_all_requirements_power_is_a_joint_lower_bound_not_minimum(tmp_path, protocol_data):
+    from sequoia_x.research.statistics import StatisticsPlan, assess_power
+
+    _, frozen, candidate, comparison, sample, execution, selection = account_example(
+        tmp_path, protocol_data
+    )
+    parameters, _, _, _ = registered_parameters(candidate, comparison, sample, execution, selection)
+    # 标准正态表：z(1-.05/24)=2.8652602385，z(.8)=.8416212336。
+    # se=.1、margin=.3706881472 时每个单方向通过概率=.8。
+    parameters["statistics_plan"].update(
+        power_alternative_return_delta=0.39068814721050486,
+        power_alternative_win_rate=0.8706881472105049,
+    )
+    plan = StatisticsPlan.model_validate(parameters["statistics_plan"])
+    summary = summarize_dependence(
+        sample.calendar,
+        (0.0,) * len(sample.calendar),
+        (0.0,) * len(sample.calendar),
+        (),
+        (),
+        ResamplingPlan(block_sessions=62, resamples=2000, seed=7),
+        confidence_level=0.95,
+        family_size=1,
+    ).model_copy(update={"return_delta_standard_error": 0.1, "win_rate_standard_error": 0.1})
+    power = assess_power(summary, frozen.protocol, plan)
+    assert [m.estimated_power for m in power.metrics] == pytest.approx([0.8, 0.8])
+    # 未假定两门槛独立：union bound为.6（独立时实际也只有.64），不能宣称.8。
+    assert power.achieved_power == pytest.approx(0.6)
+    assert any("联合" in reason for reason in power.reasons)
+
+
+def test_power_does_not_count_rejection_in_the_wrong_direction(tmp_path, protocol_data):
+    from sequoia_x.research.statistics import StatisticsPlan, assess_power
+
+    _, frozen, candidate, comparison, sample, execution, selection = account_example(
+        tmp_path, protocol_data
+    )
+    parameters, _, _, _ = registered_parameters(candidate, comparison, sample, execution, selection)
+    parameters["statistics_plan"]["power_alternative_return_delta"] = 0.03
+    plan = StatisticsPlan.model_validate(parameters["statistics_plan"])
+    summary = summarize_dependence(
+        sample.calendar,
+        (0.0,) * len(sample.calendar),
+        (0.0,) * len(sample.calendar),
+        (),
+        (),
+        ResamplingPlan(block_sessions=62, resamples=2000, seed=7),
+        confidence_level=0.95,
+        family_size=1,
+    ).model_copy(update={"return_delta_standard_error": 0.1, "win_rate_standard_error": 0.1})
+    power = assess_power(summary, frozen.protocol, plan)
+    actual = next(m.estimated_power for m in power.metrics if m.metric == "return_delta")
+    # 标准正态表：1-Phi(2.8652602385-.1)=.002843869999。
+    assert actual == pytest.approx(0.002843869999026305)
+
+
+def test_scenarios_share_mature_denominator_and_exclusions_have_account(tmp_path, protocol_data):
+    from sequoia_x.research.portfolio import run_portfolio
+    from sequoia_x.research.replay import Signal
+    from sequoia_x.research.statistics import analyze_baseline
+
+    registry, frozen, _, comparison, sample, execution, selection = account_example(
+        tmp_path, protocol_data
+    )
+    candidate = run_portfolio(
+        sample,
+        frozen,
+        execution,
+        selection,
+        signals=(
+            Signal(symbol="AAA", signal_date=sample.calendar[0]),
+            Signal(symbol="AAA", signal_date=sample.calendar[70]),
+        ),
+    )
+    parameters, reference, sectors, regimes = registered_parameters(
+        candidate,
+        comparison,
+        sample,
+        execution,
+        selection,
+    )
+    parameters["statistics_plan"]["embargo_sessions"] = 10
+    parameters["statistics_plan"]["scenarios"] = [
+        {
+            "scenario_id": "same-account",
+            "kind": "cost_stress",
+            "description": "同账户用于口径核对",
+            "account": parameters["statistics_plan"]["candidate"],
+            "cost_multiplier": 2,
+        }
+    ]
+    run = registry.start_experiment(
+        frozen.protocol_id,
+        parameters=parameters,
+        stage="final_test",
+        purpose="confirmation",
+        evidence_kind="historical_simulation",
+    )
+    report = analyze_baseline(
+        registry,
+        run.experiment_id,
+        candidate,
+        comparison,
+        snapshot=sample,
+        market_reference=reference,
+        exposure_reference=reference,
+        sector_map=sectors,
+        regime_map=regimes,
+        scenarios={"same-account": candidate},
+    )
+    assert report.candidate.raw_trade_count == report.candidate.raw_closed_trades == 2
+    assert report.candidate.closed_trades == report.candidate.purged_closed_trades == 1
+    assert report.candidate.net_win_rate == report.robustness[0].net_win_rate == 0
+    assert report.robustness[0].net_win_rate_change_vs_candidate == 0
+    assert report.maturity.excluded[0].account == "candidate"
