@@ -142,7 +142,7 @@ def summarize_dependence(
     b_win, b_mean = _trade_stats(pnl_panels[1], observed_indices)
     c_return = prod(1 + r for r in candidate_returns) - 1
     b_return = prod(1 + r for r in comparison_returns) - 1
-    years = ((calendar[-1] - calendar[0]).days + 1) / 365.2425
+    years = (calendar[-1] - calendar[0]).days / 365.25
 
     def annualized(value: float) -> float:
         return (1 + value) ** (1 / years) - 1
@@ -730,7 +730,7 @@ def _account_statistics(
         else None
     )
     years = (
-        ((account.daily_nav[-1].date - account.daily_nav[0].date).days + 1) / 365.2425
+        (account.daily_nav[-1].date - account.daily_nav[0].date).days / 365.25
         if account.daily_nav
         else None
     )

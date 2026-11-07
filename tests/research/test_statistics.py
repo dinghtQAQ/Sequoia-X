@@ -168,6 +168,10 @@ def account_example(tmp_path, protocol_data, *, sessions=180, enter=False):
     from sequoia_x.research.replay import ExecutionPolicy, FeeSchedule, Signal
 
     days = tuple(date(2024, 1, 1) + timedelta(days=i) for i in range(sessions))
+
+    def price(index):
+        return 12 if index >= 61 else (11 if index == 60 else 10)
+
     sample = DatasetSnapshot.model_validate(
         {
             "manifest": {
@@ -190,10 +194,10 @@ def account_example(tmp_path, protocol_data, *, sessions=180, enter=False):
                     "symbol": "AAA",
                     "date": day,
                     "available_on": day,
-                    "open": 12 if i >= 61 else 10,
-                    "high": 12 if i >= 61 else 10,
-                    "low": 12 if i >= 61 else 10,
-                    "close": 12 if i >= 61 else 10,
+                    "open": price(i),
+                    "high": price(i),
+                    "low": price(i),
+                    "close": price(i),
                     "volume": 1000000,
                     "price_basis": "raw",
                 }
@@ -207,10 +211,12 @@ def account_example(tmp_path, protocol_data, *, sessions=180, enter=False):
                     "listed": True,
                     "suspended": False,
                     "is_st": False,
-                    "board": "main",
-                    "limit_rule": "unbounded",
+                    "board": "SSE_MAIN",
+                    "limit_rule": "bounded",
+                    "limit_up": round(price(max(0, i - 1)) * 1.1, 2),
+                    "limit_down": round(price(max(0, i - 1)) * 0.9, 2),
                 }
-                for day in days
+                for i, day in enumerate(days)
             ],
         }
     )
@@ -225,6 +231,7 @@ def account_example(tmp_path, protocol_data, *, sessions=180, enter=False):
             ),
         ),
         slippage_bps=0,
+        max_order_quantity=1_000_000,
         max_volume_participation=1,
         volume_model="daily_volume_upper_bound",
     )
@@ -242,7 +249,7 @@ def account_example(tmp_path, protocol_data, *, sessions=180, enter=False):
         initial_capital=10000,
         max_position_fraction=1,
         max_positions=1,
-        entry_order_time="signal_next_session_open_day",
+        entry_order_time="next_session_open_limit",
         fees=[f"execution_policy:{execution.policy_id}"],
         capacity=f"selection_policy:{selection.policy_id}",
     )
@@ -283,6 +290,14 @@ def test_zero_trade_report_keeps_nav_risk_and_immutable_failure(tmp_path, protoc
     assert record_report(report, tmp_path / "reports") == saved
     with pytest.raises(ValueError, match="已有结果"):
         analyze_baseline(registry, run.experiment_id, candidate, comparison, snapshot=sample)
+    with pytest.raises(ValueError, match="最终测试日期已使用"):
+        registry.start_experiment(
+            frozen.protocol_id,
+            parameters={},
+            stage="final_test",
+            purpose="confirmation",
+            evidence_kind="historical_simulation",
+        )
 
 
 def test_one_hand_calculated_trade_reports_expectancy_and_missing_loss_group(
@@ -306,10 +321,13 @@ def test_one_hand_calculated_trade_reports_expectancy_and_missing_loss_group(
     report = analyze_baseline(registry, run.experiment_id, candidate, comparison, snapshot=sample)
     assert report.candidate.closed_trades == 1
     assert report.candidate.net_win_rate == 1
-    assert report.candidate.net_expectancy == 2000
-    assert report.candidate.average_win == 2000
+    assert report.candidate.net_expectancy == 1800
+    assert report.candidate.average_win == 1800
     assert report.candidate.average_loss is report.candidate.payoff_ratio is None
-    assert report.candidate.portfolio_net_return == pytest.approx(0.2)
+    assert report.candidate.portfolio_net_return == pytest.approx(0.18)
+    assert report.candidate.annualized_net_return == pytest.approx(
+        candidate.metrics.annualized_net_return
+    )
     assert report.comparison.net_win_rate is None
     assert report.decision.status == "insufficient_evidence"
 
@@ -334,7 +352,7 @@ def test_unfinished_position_does_not_become_a_win_or_disappear(tmp_path, protoc
     assert report.candidate.closed_trades == 0
     assert report.candidate.net_win_rate is report.candidate.net_expectancy is None
     assert report.candidate.open_positions == report.candidate.unfinished_trades == 1
-    assert report.candidate.open_exposure == 1
+    assert report.candidate.open_exposure == 0.9
 
 
 def registered_parameters(candidate, comparison, sample, execution, selection):
@@ -697,3 +715,371 @@ def test_scenarios_share_mature_denominator_and_exclusions_have_account(tmp_path
     assert report.candidate.net_win_rate == report.robustness[0].net_win_rate == 0
     assert report.robustness[0].net_win_rate_change_vs_candidate == 0
     assert report.maturity.excluded[0].account == "candidate"
+
+
+def controlled_initial_report(tmp_path, protocol_data):
+    """仅覆盖observed资格与通过分支的受控构造，绝非真实市场证据。"""
+    from copy import deepcopy
+    from math import pi, sin
+
+    from sequoia_x.research.dataset import DatasetSnapshot
+    from sequoia_x.research.portfolio import IMPLEMENTATION_VERSION, PortfolioPolicy, run_portfolio
+    from sequoia_x.research.protocol import ResearchProtocol
+    from sequoia_x.research.registry import ResearchRegistry
+    from sequoia_x.research.replay import ExecutionPolicy, FeeSchedule
+    from sequoia_x.research.statistics import (
+        AccountContract,
+        ReferenceDay,
+        ReferenceSeries,
+        RegimeMap,
+        RegimePeriod,
+        ResamplingPlan,
+        ScenarioContract,
+        SectorMap,
+        SectorRecord,
+        StatisticsPlan,
+        analyze_baseline,
+        implementation_fingerprint,
+        record_report,
+    )
+
+    calendar = tuple(date(2028, 1, 2) + timedelta(days=i) for i in range(900))
+    symbols = ("600001", "600002", "600003")
+    bars, states = [], []
+    for number, symbol in enumerate(symbols):
+        period, drift = (30, -0.001) if number == 2 else (120, 0.006)
+        prices = [
+            round(20 + drift * i + 1.5 * sin(2 * pi * i / period + number + 0.37), 2)
+            for i in range(len(calendar))
+        ]
+        for i, (day, price) in enumerate(zip(calendar, prices)):
+            cross = (
+                i >= 20
+                and sum(prices[i - 5 : i]) / 5 < sum(prices[i - 20 : i]) / 20
+                and sum(prices[i - 4 : i + 1]) / 5 > sum(prices[i - 19 : i + 1]) / 20
+            )
+            bars.append(
+                dict(
+                    symbol=symbol,
+                    date=day,
+                    available_on=day,
+                    open=price,
+                    high=round(price * 1.001, 2),
+                    low=round(price * 0.999, 2),
+                    close=price,
+                    volume=100000 if cross else 10000,
+                    price_basis="raw",
+                )
+            )
+            previous = prices[max(0, i - 1)]
+            states.append(
+                dict(
+                    symbol=symbol,
+                    effective_date=day,
+                    available_on=day,
+                    listed=True,
+                    suspended=False,
+                    is_st=False,
+                    board="SSE_MAIN",
+                    lot_size=100,
+                    limit_rule="bounded",
+                    limit_up=round(previous * 1.1, 2),
+                    limit_down=round(previous * 0.9, 2),
+                )
+            )
+    snapshot = DatasetSnapshot.model_validate(
+        dict(
+            manifest=dict(
+                source="controlled-observed-tag-NOT-empirical",
+                source_version="fixture-v2-different-calendar-and-prices",
+                universe_id="controlled-three-symbols",
+                symbols=symbols,
+                start=calendar[0],
+                end=calendar[-1],
+                as_of=calendar[-1],
+                evidence_kind="observed",
+                universe_complete=True,
+                states_complete=True,
+                actions_complete=True,
+                calendar_complete=True,
+            ),
+            calendar=calendar,
+            bars=bars,
+            states=states,
+        )
+    )
+
+    def execution(multiplier):
+        return ExecutionPolicy(
+            fees=(
+                FeeSchedule(
+                    effective_from=date(2000, 1, 1),
+                    commission_rate=0.0001 * multiplier,
+                    min_commission=1 * multiplier,
+                    stamp_tax_rate=0,
+                    transfer_fee_rate=0,
+                ),
+            ),
+            slippage_bps=1 * multiplier,
+            max_volume_participation=1,
+            volume_model="daily_volume_upper_bound",
+            max_order_quantity=1000000,
+            order_type="limit_at_verified_session_bounds",
+        )
+
+    base_execution, stress_execution = execution(1), execution(2)
+    selection = PortfolioPolicy(daily_entry_slots=3, selection="symbol_order", seed=7)
+    values = deepcopy(protocol_data)
+    values.update(
+        data_snapshot_id=snapshot.snapshot_id,
+        universe=snapshot.manifest.universe_id,
+        data_cutoff=calendar[-1],
+        final_test={"start": calendar[0], "end": calendar[-1]},
+        comparison_role="initial_reference",
+    )
+    values["statistics"].update(
+        dependence_method="moving_block_signal_date_v1",
+        multiplicity_method="bonferroni_family_metrics_v1",
+    )
+    values["acceptance"].update(
+        minimum_return_delta=0.001,
+        minimum_win_rate=0.05,
+        minimum_win_rate_delta=None,
+        max_drawdown=1,
+        max_open_exposure=1,
+    )
+    values["trading"].update(
+        initial_capital=100000,
+        max_position_fraction=0.3,
+        max_positions=3,
+        repeat_signal_policy="ignore_while_open",
+        entry_order_time="next_session_open_limit",
+        fees=[f"execution_policy:{base_execution.policy_id}"],
+        capacity=f"selection_policy:{selection.policy_id}",
+    )
+    registry = ResearchRegistry(tmp_path / "b0-branch.sqlite")
+    frozen = registry.freeze(ResearchProtocol.model_validate(values))
+    control_values = deepcopy(values)
+    control_values.update(
+        study_id="cash-reference", strategy_version="cash-control", comparison_version="cash-anchor"
+    )
+    control = registry.freeze(ResearchProtocol.model_validate(control_values))
+    stress_values = deepcopy(values)
+    stress_values["study_id"] = "stress-reference"
+    stress_values["trading"]["fees"] = [f"execution_policy:{stress_execution.policy_id}"]
+    stressed = registry.freeze(ResearchProtocol.model_validate(stress_values))
+    neighbor_values = deepcopy(values)
+    neighbor_values.update(study_id="neighbor-reference", strategy_version="ma-v2")
+    neighbor_values["trading"]["max_position_fraction"] = 0.25
+    neighbor = registry.freeze(ResearchProtocol.model_validate(neighbor_values))
+
+    def contract(item, policy=base_execution):
+        return AccountContract(
+            protocol_id=item.protocol_id,
+            strategy_version=item.protocol.strategy_version,
+            implementation_version=IMPLEMENTATION_VERSION,
+            execution_policy_id=policy.policy_id,
+            selection_policy_id=selection.policy_id,
+        )
+
+    reference = ReferenceSeries(
+        source_version="controlled-reference-v1",
+        description="Controlled same-calendar reference",
+        days=tuple(ReferenceDay(date=d, net_return=0) for d in calendar),
+    )
+    sectors = SectorMap(
+        source_version="controlled-sector-v1",
+        records=tuple(
+            SectorRecord(
+                symbol=s,
+                sector=f"sector-{i}",
+                start=calendar[0],
+                end=calendar[-1],
+                available_on=calendar[0],
+            )
+            for i, s in enumerate(symbols)
+        ),
+    )
+    regimes = RegimeMap(
+        source_version="controlled-regime-v1",
+        periods=(
+            RegimePeriod(
+                label="controlled-regime",
+                start=calendar[0],
+                end=calendar[-1],
+                available_on=calendar[0],
+            ),
+        ),
+    )
+    plan = StatisticsPlan(
+        strategy_family="ma",
+        resampling=ResamplingPlan(block_sessions=62, resamples=5000, seed=23),
+        embargo_sessions=0,
+        dependence_method="moving_block_signal_date_v1",
+        multiplicity_method="bonferroni_family_metrics_v1",
+        assumption="weak_stationarity_block_length_covers_dependence",
+        implementation_fingerprint=implementation_fingerprint(),
+        candidate=contract(frozen),
+        comparison=contract(control),
+        market_reference_id=reference.reference_id,
+        exposure_reference_id=reference.reference_id,
+        sector_map_id=sectors.map_id,
+        regime_map_id=regimes.map_id,
+        power_method="normal_block_standard_error_v1",
+        power_alternative_return_delta=1,
+        power_alternative_win_rate=0.95,
+        scenarios=(
+            ScenarioContract(
+                scenario_id="cost-2x",
+                kind="cost_stress",
+                description="All fees and slippage 2x",
+                account=contract(stressed, stress_execution),
+                cost_multiplier=2,
+            ),
+            ScenarioContract(
+                scenario_id="position-neighbor",
+                kind="parameter_neighbor",
+                description="Position fraction 0.25",
+                account=contract(neighbor),
+                parameter_changes={"trading.max_position_fraction": 0.25},
+            ),
+        ),
+        minimum_scenario_return_delta=0,
+    )
+    parameters = dict(
+        statistics_plan=plan.model_dump(mode="json"),
+        execution_policies={
+            p.policy_id: p.model_dump(mode="json") for p in (base_execution, stress_execution)
+        },
+        selection_policies={selection.policy_id: selection.model_dump(mode="json")},
+    )
+    run = registry.start_experiment(
+        frozen.protocol_id,
+        parameters=parameters,
+        stage="final_test",
+        purpose="confirmation",
+        evidence_kind="historical_simulation",
+    )
+    benchmark = {day: 100.0 for day in calendar}
+    candidate = run_portfolio(snapshot, frozen, base_execution, selection, benchmark=benchmark)
+    comparison = run_portfolio(
+        snapshot, control, base_execution, selection, signals=(), benchmark=benchmark
+    )
+    scenarios = {
+        "cost-2x": run_portfolio(
+            snapshot, stressed, stress_execution, selection, benchmark=benchmark
+        ),
+        "position-neighbor": run_portfolio(
+            snapshot, neighbor, base_execution, selection, benchmark=benchmark
+        ),
+    }
+    report = analyze_baseline(
+        registry,
+        run.experiment_id,
+        candidate,
+        comparison,
+        snapshot=snapshot,
+        market_reference=reference,
+        exposure_reference=reference,
+        sector_map=sectors,
+        regime_map=regimes,
+        scenarios=scenarios,
+    )
+    saved = record_report(report, tmp_path / "reports")
+    return registry, report, run, saved
+
+
+def test_controlled_initial_b0_uses_actual_replay_and_keeps_cash_metrics_na(
+    tmp_path, protocol_data
+):
+    from time import perf_counter
+
+    from sequoia_x.research.statistics import load_report
+
+    started = perf_counter()
+    registry, report, run, saved = controlled_initial_report(tmp_path, protocol_data)
+    elapsed = perf_counter() - started
+    print(
+        {
+            "fixture_only_not_empirical": True,
+            "elapsed_seconds": elapsed,
+            "registry": str(registry.path),
+            "report": saved.path,
+            "report_sha256": saved.sha256,
+            "experiment": run.experiment_id,
+            "seed": 23,
+            "sessions": 900,
+            "status": report.decision.status,
+            "reasons": report.decision.reasons,
+        }
+    )
+    assert report.diagnostic_gaps == ()
+    assert report.decision.status == "adopted"
+    assert report.b0_version == "ma-v1"
+    assert report.strategy_family == "ma"
+    assert report.candidate.closed_trades > 0
+    assert report.comparison.closed_trades == 0
+    assert report.comparison.net_win_rate is report.comparison.net_expectancy is None
+    assert report.intervals.comparison_win_rate is None
+    assert report.intervals.win_rate_delta is None
+    assert report.intervals.candidate_win_rate.lower > 0.05
+    assert report.intervals.return_delta.lower > 0.001
+    assert report.power.achieved_power >= 0.8
+    assert {scenario.kind for scenario in report.robustness} == {
+        "cost_stress",
+        "parameter_neighbor",
+    }
+    assert all(scenario.reasons == () for scenario in report.robustness)
+    assert load_report(saved.path, saved.sha256) == report
+    with pytest.raises(ValueError, match="已有通过版本|最终测试日期已使用"):
+        registry.start_experiment(
+            run.protocol_id,
+            parameters={},
+            stage="final_test",
+            purpose="confirmation",
+            evidence_kind=run.evidence_kind,
+        )
+
+
+def test_actual_flag_portfolio_has_separate_zero_episode_report(tmp_path, protocol_data):
+    from sequoia_x.research.flag import run_flag_portfolio
+    from sequoia_x.research.protocol import ResearchProtocol
+    from sequoia_x.research.statistics import analyze_baseline
+
+    registry, ma_frozen, _, comparison, sample, execution, selection = account_example(
+        tmp_path, protocol_data
+    )
+    values = ma_frozen.protocol.model_dump(mode="json")
+    values.update(study_id="flag-baseline", strategy_version="flag-v1")
+    values["statistics"].update(family_id="flag-family", family_members=["flag-v1", "flag-v2"])
+    frozen = registry.freeze(ResearchProtocol.model_validate(values))
+    flag = run_flag_portfolio(sample, frozen, execution, selection)
+    parameters, reference, sectors, regimes = registered_parameters(
+        flag.portfolio, comparison, sample, execution, selection
+    )
+    parameters["statistics_plan"]["strategy_family"] = "flag"
+    run = registry.start_experiment(
+        frozen.protocol_id,
+        parameters=parameters,
+        stage="final_test",
+        purpose="confirmation",
+        evidence_kind="historical_simulation",
+    )
+    report = analyze_baseline(
+        registry,
+        run.experiment_id,
+        flag.portfolio,
+        comparison,
+        snapshot=sample,
+        market_reference=reference,
+        exposure_reference=reference,
+        sector_map=sectors,
+        regime_map=regimes,
+    )
+    assert flag.replay.coverage.episode_count == 0
+    assert report.strategy_family == "flag"
+    assert report.candidate.closed_trades == report.candidate.independent_episodes == 0
+    assert report.candidate.net_win_rate is report.candidate.net_expectancy is None
+    assert report.intervals.candidate_win_rate is report.intervals.candidate_expectancy is None
+    assert report.b0_version is None
+    assert report.decision.status == "insufficient_evidence"

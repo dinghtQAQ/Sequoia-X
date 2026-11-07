@@ -55,9 +55,9 @@ run = registry.start_experiment(
     candidate_frozen.protocol_id, parameters=parameters, stage="final_test",
     purpose="confirmation", evidence_kind="historical_simulation",
 )
-candidate = run_portfolio(snapshot, candidate_frozen, execution, selection, window=run.used_window)
+candidate = run_portfolio(snapshot, candidate_frozen, execution, selection, benchmark=market_levels, window=run.used_window)
 comparison = run_portfolio(
-    snapshot, comparison_frozen, execution, selection, signals=(), window=run.used_window,
+    snapshot, comparison_frozen, execution, selection, signals=(), benchmark=market_levels, window=run.used_window,
 )  # 此例参考为现金；必须有自己的冻结 cash-control 版本，不能事后改名。
 report = analyze_baseline(
     registry, run.experiment_id, candidate, comparison, snapshot=snapshot,
@@ -69,6 +69,9 @@ saved = record_report(report, "data/research-reports")
 
 `StatisticsPlan.model_json_schema()` 给出全部参数契约。源码指纹来自
 `implementation_fingerprint()`，必须在实验登记前固定；代码发生变化后旧计划不能继续确认。
+所有账户（包括现金参考与诊断场景）须传入完整同日历的正值基准指数 `market_levels`；
+缺少该序列不能仅靠有参照描述而通过资格。年化沿用共享账户口径：最后日减首日的
+实际日历天数除以 365.25；零经过天数不估计年化。
 参考、行业及市场阶段映射也按内容 hash 绑定；行业和阶段标签须在对应信号日已知，
 缺失或多义标签进入报告并阻断通过。描述性分组不能事后晋升为获利规则。
 登记簿无法观察库外已经看过的数据，外部使用仍须如实声明。
@@ -150,3 +153,22 @@ assert not protocol.exploration_reasons()
 日收益滞后相关、季度/行业/市场阶段集中、最大与前五笔盈利贡献、参照超额及全部场景。
 零完整交易的胜率/期望/相应区间为 NA；缺少盈利或亏损组时条件均值及盈亏比为 NA。
 净期望直接使用全部成熟完整交易净盈亏均值，未平仓估值不会变成一次“胜利”。
+
+## 实现验证与真实结论
+
+`tests/research/test_statistics.py` 的完整正向集成案例，固定 900 个 session、
+连续块长 62、5000 次重采样与 seed 23，先登记所有门槛、参照和场景，再执行
+共享账户。它为了覆盖合格来源路径而使用显式 `controlled-...-NOT-empirical`
+来源与 `observed` 测试标签；全部价格是构造值。其 `adopted` 只验证软件判据，
+不能成为 MA/flag 的真实收益 B0。真实来源、研究前经济门槛和统计假设仍须独立提供。
+
+可复现命令：
+
+```sh
+python -m pytest -q -s tests/research/test_statistics.py::test_controlled_initial_b0_uses_actual_replay_and_keeps_cash_metrics_na
+```
+
+该测试保存完整内容寻址报告，确认现金参考的交易胜率、期望和胜率变化均为 `null`，
+候选独立满足收益区间、绝对胜率、联合功效与稳健性条件，并确认已有通过版本后
+不能再走初始参考路径。其他案例覆盖已失败最终区间不可复用、同日聚集、跨边界标签、
+不支持方法、来源/账本篡改、零交易和未平仓风险。
