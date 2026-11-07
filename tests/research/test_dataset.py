@@ -1,4 +1,6 @@
-"""数据契约的公开边界；所有手工行情均为 synthetic，非市场证据。"""
+"""数据契约的公开边界；手工输入仅验证功能，非市场证据。"""
+
+import pytest
 
 from sequoia_x.research.dataset import DatasetSnapshot, audit_dataset
 
@@ -271,3 +273,55 @@ def test_conflicting_revisions_on_same_ex_date_are_not_independent_distributions
     report = audit_dataset(DatasetSnapshot.model_validate(data))
     assert not report.replay_eligible
     assert any("同日公司行动" in reason for reason in report.reasons)
+
+
+@pytest.mark.parametrize("evidence_kind", ["synthetic", "observed"])
+@pytest.mark.parametrize("warmup", [False, True])
+@pytest.mark.parametrize(
+    "raw_prices",
+    [
+        {"open": 10, "high": 100, "low": 10, "close": 100},
+        {"open": 10, "high": 10, "low": 5, "close": 5},
+    ],
+)
+def test_raw_prices_outside_daily_limits_block_qualification_and_warmup(
+    warmup: bool, raw_prices: dict, evidence_kind: str
+) -> None:
+    data = sample_data()
+    data["manifest"]["evidence_kind"] = evidence_kind
+    if warmup:
+        data["manifest"]["start"] = "2024-01-03"
+    data["states"][0].update({"limit_down": 9, "limit_up": 11})
+    data["bars"][0].update(raw_prices)
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert report.status == "data_unqualified"
+    assert not report.replay_eligible
+    assert any("原始OHLC超出当日涨跌停" in reason for reason in report.reasons)
+
+
+def test_daily_price_boundaries_are_inclusive_and_only_apply_to_raw_prices() -> None:
+    data = sample_data()
+    data["manifest"].update(
+        {
+            "indicator_price_basis": "point_in_time_adjusted",
+            "indicator_source_version": "fixture-v2",
+        }
+    )
+    for bar in data["bars"]:
+        bar.update(
+            {
+                "open": 10,
+                "high": 11,
+                "low": 9,
+                "close": 11,
+                "indicator_open": 100,
+                "indicator_high": 110,
+                "indicator_low": 90,
+                "indicator_close": 110,
+                "indicator_available_on": bar["date"],
+            }
+        )
+    for state in data["states"]:
+        state.update({"limit_down": 9, "limit_up": 11})
+    report = audit_dataset(DatasetSnapshot.model_validate(data))
+    assert report.replay_eligible
