@@ -375,25 +375,29 @@ class _SharedAccount:
         self.cash += _amount(fill.cash_delta)
         costs = _fill_costs(fill)
         self.day_costs += costs
-        if fill.reason.startswith(
-            (
-                "unsupported",
-                "unknown",
-                "missing",
-                "invalid",
-                "state_",
-                "execution_requires",
-                "execution_bar_",
-                "raw_prices_",
-                "risk_warning_",
-            )
-        ):
-            reason = f"{order.order_id}:{fill.reason}"
-            self.execution_reasons.append(reason)
-            self.reasons.append("执行模型或输入未覆盖:" + reason)
+        self._record_execution_support(fill, order.order_id)
         if self.cash < 0:
             raise ArithmeticError("账户现金守恒失败：出现借款")
         return costs
+
+    def _record_execution_support(self, fill: FillAttempt, context: str) -> None:
+        # Known modelled restrictions are risk, not an unsupported execution model.
+        if fill.reason in {
+            "daily_volume_is_simulation_upper_bound",
+            "not_tradable",
+            "t_plus_one",
+            "insufficient_cash_at_limit_or_lot",
+            "open_at_limit_up",
+            "open_at_limit_down",
+            "slipped_price_outside_observed_range",
+            "slipped_price_outside_price_limits",
+            "insufficient_capacity_or_lot",
+            "insufficient_cash_for_execution_costs",
+        }:
+            return
+        reason = f"{context}:{fill.reason}"
+        self.execution_reasons.append(reason)
+        self.reasons.append("执行模型或输入未覆盖:" + reason)
 
     def _prepare_opening_buys(
         self,
@@ -563,7 +567,7 @@ class _SharedAccount:
                 for reason in adjustment.reasons
             )
 
-    def _sell_due(self, session: date, pre_auction_cash: Decimal) -> None:
+    def _sell_due(self, session: date, pre_auction_cash: Decimal) -> Decimal:
         fee_cash = max(Decimal(0), pre_auction_cash - self._reserved())
         for position, order in enumerate(self.orders):
             if (
@@ -616,6 +620,8 @@ class _SharedAccount:
                     "released_quantity": fill.released_quantity,
                 }
             )
+
+        return fee_cash
 
     def _schedule_exits(self, session: date, index: int) -> None:
         for lot in self.lots.values():
@@ -751,32 +757,32 @@ class _SharedAccount:
                 )
             )
 
-    def _unexitable_value(self, session: date) -> Decimal:
+    def _unexitable_value(self, session: date, fee_cash: Decimal) -> Decimal:
+        """Preview remaining exposure at this session's auction; never place orders."""
         value = Decimal(0)
+        used_volume = self.used_volume.copy()
         for lot in self.lots.values():
             if not lot.quantity:
                 continue
-            state = self.snapshot.state_at(lot.signal.symbol, session)
-            bar = self._bar(lot.signal.symbol, session)
-            unavailable = (
-                bool(lot.exit_reasons)
-                or lot.entry_date == session
-                or state is None
-                or not state.listed
-                or state.suspended
-                or state.limit_rule == "unknown"
-                or bar is None
-                or bar.status != "trading"
+            symbol = lot.signal.symbol
+            fill = quote_open_fill(
+                self._bar(symbol, session),
+                self.snapshot.state_at(symbol, session),
+                "sell",
+                lot.quantity,
+                float(fee_cash),
+                self.execution,
+                acquired_on=lot.entry_date,
+                used_volume=used_volume.get(symbol, 0),
             )
-            if state is not None and bar is not None and state.limit_rule == "bounded":
-                unavailable = (
-                    unavailable
-                    or state.limit_down is None
-                    or bar.open is None
-                    or (bar.open <= state.limit_down)
-                )
-            if unavailable:
-                value += lot.last_market_value
+            self._record_execution_support(
+                fill, f"holding:{session.isoformat()}:{lot.signal.signal_id}"
+            )
+            used_volume[symbol] = used_volume.get(symbol, 0) + fill.quantity
+            # Just as in actual matching, positive sale proceeds cannot pre-fund
+            # another order's fees in the same auction.
+            fee_cash += min(Decimal(0), _amount(fill.cash_delta))
+            value += lot.last_market_value * (lot.quantity - fill.quantity) / lot.quantity
         return value
 
     def _trades(self) -> tuple[PortfolioTrade, ...]:
@@ -821,6 +827,7 @@ class _SharedAccount:
         previous_nav = _amount(self.frozen.protocol.trading.initial_capital)
         peak = previous_nav
         max_drawdown = Decimal(0)
+        unexitable_value = Decimal(0)
         for index, session in enumerate(self.calendar):
             self.day_costs = Decimal(0)
             self.used_volume = {}
@@ -829,9 +836,10 @@ class _SharedAccount:
             prepared = self._prepare_opening_buys(
                 session, opening_cash, previous_nav - self.day_costs
             )
-            self._sell_due(session, opening_cash)
+            exit_fee_cash = self._sell_due(session, opening_cash)
             self._buy_pending(session, index, prepared)
             positions, flags = self._mark(session)
+            unexitable_value = self._unexitable_value(session, exit_fee_cash)
             market = sum((_amount(position.market_value) for position in positions), Decimal(0))
             receivables = sum(
                 (_amount(item.amount) for lot in self.lots.values() for item in lot.receivables),
@@ -921,7 +929,7 @@ class _SharedAccount:
                     {lot.signal.symbol for lot in self.lots.values() if lot.quantity}
                 ),
                 open_exposure=last.open_exposure,
-                unexitable_exposure=float(self._unexitable_value(last.date)) / last.nav
+                unexitable_exposure=float(unexitable_value) / last.nav
                 if last.nav
                 else 0,
                 unfinished_trades=sum(trade.status == "open" for trade in trades),
