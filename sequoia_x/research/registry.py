@@ -151,6 +151,8 @@ class ResearchRegistry:
                 if stage != "final_test":
                     raise ValueError("确认性验收必须使用最终测试区间")
                 current = self._latest_approved(events, protocol.study_id, evidence_kind)
+                if current is not None and protocol.comparison_role == "initial_reference":
+                    raise ValueError("已有通过版本，不能重新使用初始参考模式")
                 if current is not None and protocol.comparison_version != current:
                     raise ValueError("确认性实验必须相对最近通过版本进行配对比较")
                 if self._test_data_used(events, protocol.final_test):
@@ -260,6 +262,8 @@ class ResearchRegistry:
                 )
             elif failure_reason:
                 pass
+            elif current is not None and frozen.protocol.comparison_role == "initial_reference":
+                reasons = ("已有通过版本，已登记的初始参考实验也不能重新起步",)
             elif current is not None and current != run.comparison_version:
                 reasons = ("对照不是最近通过版本，须重新冻结配对比较协议",)
             elif self._test_data_used(events, run.used_window, exclude_id=run.experiment_id):
