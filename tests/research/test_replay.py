@@ -743,3 +743,25 @@ def test_raw_prices_outside_verified_daily_limits_cannot_create_fills_or_nav():
     assert mark.status == "unreliable"
     assert mark.value is None
     assert mark.reason == "market_close_outside_verified_price_limits"
+
+
+def test_future_matching_data_cannot_change_pre_registered_submission_or_reservation():
+    numeric_policy = zero_cost_policy()
+    inputs = [
+        bar(open=10),
+        bar(open=12),
+        bar(volume=0),
+        bar(open=100, high=100, low=100, close=100),
+        None,
+    ]
+    for realized_bar in inputs:
+        attempt = quote_open_fill(realized_bar, state(), "buy", 600, 6000, numeric_policy)
+        assert attempt.limit_price == 12
+        assert attempt.submitted_quantity == 500
+        assert attempt.unsubmitted_quantity == 100
+        assert attempt.reserved_cash == 6000
+    assert quote_open_fill(inputs[0], state(), "buy", 600, 6000, numeric_policy).quantity == 500
+    for realized_bar in inputs[1:]:
+        assert (
+            quote_open_fill(realized_bar, state(), "buy", 600, 6000, numeric_policy).quantity == 0
+        )
