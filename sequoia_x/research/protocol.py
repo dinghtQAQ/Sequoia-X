@@ -114,6 +114,7 @@ class ResearchProtocol(FrozenModel):
     hypothesis: str
     strategy_version: str
     comparison_version: str
+    comparison_role: Literal["approved_strategy", "initial_reference"] = "approved_strategy"
     universe: str
     data_snapshot_id: str
     data_cutoff: date
@@ -135,6 +136,11 @@ class ResearchProtocol(FrozenModel):
             raise ValueError("训练、验证、最终测试区间必须按时间排列且不重叠（含首尾日期）")
         if self.final_test.end > self.data_cutoff:
             raise ValueError("最终测试不能晚于数据截止日")
+        if self.comparison_role == "initial_reference":
+            if self.acceptance.claim != "return_improvement":
+                raise ValueError("初始参考只能检验净收益增量和候选绝对胜率，不能声称胜率增量")
+            if self.acceptance.minimum_win_rate_delta is not None:
+                raise ValueError("初始参考的胜率增量未定义，不得设置增量门槛")
         if self.strategy_version == self.comparison_version:
             raise ValueError("候选策略版本必须与对照版本不同")
         return self
@@ -144,6 +150,9 @@ class ResearchProtocol(FrozenModel):
         reasons = []
         for section in ("statistics", "acceptance"):
             for name, value in getattr(self, section).model_dump().items():
+                if (self.comparison_role == "initial_reference"
+                        and section == "acceptance" and name == "minimum_win_rate_delta"):
+                    continue
                 if value is None or value == ():
                     reasons.append(f"缺少 {section}.{name}")
         if self.strategy_version not in self.statistics.family_members:
